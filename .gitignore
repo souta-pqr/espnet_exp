@@ -1,10 +1,15 @@
 # 音声・特徴量・学習成果物は一切コミットしない
+# （末尾 / はディレクトリにしか一致しないため、symlink 用に / 無しも書く）
 data/
 dump/
 exp/
 feats/
 tt_eval_logs/
 tt_analysis/
+egs2/*/*/data
+egs2/*/*/dump
+egs2/*/*/exp
+egs2/*/*/feats
 *.ark
 *.scp
 *.flac

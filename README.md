@@ -2,14 +2,41 @@
 
 CEJC を用いた発話区間末タグ推定（継続 / 完了 / 相槌）の ESPnet2 レシピと、そのための ESPnet 改変・追加モジュール。
 
-**これは ESPnet 本体のオーバーレイです。**単体では動きません。ESPnet を clone した上に、
-同じディレクトリ構造のままファイルを重ねて使います。
+## セットアップ
+
+Python パッケージ（`espnet2/`, `espnet/`）とルート `utils/` を同梱しているので、
+このリポジトリ単体で `run_*.sh` が動きます。必要なのは以下だけです。
 
 ```bash
-git clone https://github.com/espnet/espnet.git
-cd espnet && (tools のセットアップ)
-rsync -a /path/to/espnet_multitask/espnet2/  espnet2/
-rsync -a /path/to/espnet_multitask/egs2/     egs2/
+# 1. Python 環境を用意し、このリポジトリを editable install する
+#    （既に espnet が editable install されている環境なら、張り替えになる）
+cd /path/to/espnet_multitask
+pip install -e .
+
+# 2. tools/activate_python.sh を自分の環境に合わせる
+#    （path.sh がこれを source する。無いと素の python3 が使われて
+#      ModuleNotFoundError: No module named 'espnet2' で即死する）
+vi tools/activate_python.sh
+
+# 3. データを繋ぐ（音声はリポジトリに含めていない）
+cd egs2/cejc/asr1
+ln -s /path/to/original/data data
+ln -s /path/to/original/dump dump
+```
+
+> **`pip install -e .` が必要な理由**: conda 環境に別の espnet が editable install されていると、
+> PEP 660 の meta-path finder が働くため `PYTHONPATH` では上書きできず、`import espnet2` が
+> 元のディレクトリを指し続けます。専用の環境を作るか、このリポジトリで install を張り替えてください。
+
+### exp/ の扱い（注意）
+
+`exp/` は**元の作業ディレクトリと共有しないでください**。同じ実験タグの学習が同時に走ると、
+同一ディレクトリに 2 プロセスが書き込んで壊れます。Stage1 の学習済みモデルだけを
+読み取り用に繋ぐのが安全です。
+
+```bash
+mkdir -p exp
+ln -s /path/to/original/exp/asr_<Stage1タグ> exp/asr_<Stage1タグ>
 ```
 
 ## 構成
@@ -22,7 +49,9 @@ rsync -a /path/to/espnet_multitask/egs2/     egs2/
 | `egs2/cejc/asr1/myconf/` | 学習・デコード config（参照されているもののみ） |
 | `egs2/cejc/asr1/local/` | 過去文脈データの生成、タグ評価 |
 | `egs2/cejc/asr1/{utils,scripts,pyscripts}/` | ESPnet 標準の補助スクリプト |
-| `espnet2/` | 改変ファイルと自作モデル（下記） |
+| `espnet2/`, `espnet/` | ESPnet 本体（改変ファイルと自作モデルを含む・下記） |
+| `utils/` | ESPnet ルートの共通スクリプト（レシピ内 symlink の解決先） |
+| `tools/` | `extra_path.sh` と `activate_python.sh` |
 
 ## espnet2 側の内訳
 
@@ -63,12 +92,19 @@ pool=query slots=8 scope=same NS="1 5" ./eval_xfmr_pool_series.sh
 
 ## utils/ 内のシンボリックリンクについて
 
-`utils/`, `scripts/`, `pyscripts/` の一部は ESPnet ルートの `utils/` を指すシンボリックリンクです
-（例: `pyscripts/audio/trim_silence.py -> ../../../../../utils/trim_silence.py`）。
-このリポジトリ単体ではリンク切れに見えますが、**ESPnet clone の上に重ねた時点で解決します**。
-上流のファイルを二重に持たないための構造なので、そのままにしてあります。
+レシピ内の `utils/`, `scripts/`, `pyscripts/` の一部は、ESPnet ルートの `utils/` を指す
+シンボリックリンクです（上流ファイルを二重に持たないための ESPnet の構造）。
+ルート `utils/` を同梱しているので**すべて解決します**。
 
-例外として `utils/simple_dict.sh` はコピー元の時点でリンク切れでした（本リポジトリ由来の問題ではありません）。
+例外として `utils/simple_dict.sh` だけはコピー元の時点でリンク切れでした
+（本リポジトリ由来の問題ではありません）。
+
+## 外部ツールについて
+
+`tools/` には `extra_path.sh` と `activate_python.sh` だけを入れています。
+sctk（採点用 sclite）、sentencepiece、warp-transducer などのビルド成果物は
+リポジトリに含めていません。`--token_type word` の現行レシピでは使いませんが、
+必要になったら本家 ESPnet の `tools/Makefile` で用意してください。
 
 ## 含めていないもの
 
