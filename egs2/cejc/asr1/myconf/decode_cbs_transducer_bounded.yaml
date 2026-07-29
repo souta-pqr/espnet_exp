@@ -1,0 +1,9 @@
+beam_size: 20
+lm_weight: 0.0
+penalty: 0.0
+maxlenratio: 0.0
+minlenratio: 0.0
+transducer_conf:
+    search_type: alsd       # 出力長を u_max で上限化＝1発話でのシンボル無限生成（メモリ暴走）を防ぐ
+    u_max: 50               # 最大出力トークン長。短い発話でも有界ループで必ず終了
+    score_norm: True

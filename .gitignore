@@ -1,0 +1,27 @@
+# 音声・特徴量・学習成果物は一切コミットしない
+data/
+dump/
+exp/
+feats/
+tt_eval_logs/
+tt_analysis/
+*.ark
+*.scp
+*.flac
+*.wav
+*.pth
+
+# 実行時に生成される config（run_*.sh が sed で作る）
+egs2/*/*/myconf/.gen_*.yaml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# バックアップ
+*.backup
+*.backup[0-9]
+*.bak
+*.broken
+*.orig

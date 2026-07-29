@@ -1,0 +1,125 @@
+# Stage2 + LoRA: 凍結エンコーダに LoRA を挿し、区間末タグ損失だけでエンコーダを軽く適応。
+# train_asr_turntaking_xfmr.yaml との差分は末尾の「LoRA 関連」ブロックと tt_adapt のみ。
+#   注意: エンコーダが適応するため ASR の CER は Stage1 と同一ではなくなる（劣化量を計測する）。
+
+# encoder related
+encoder: contextual_block_conformer
+encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 2048
+    num_blocks: 12
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.0
+    input_layer: conv2d
+    normalize_before: true
+    activation_type: swish
+    macaron_style: true
+    use_cnn_module: true
+    cnn_module_kernel: 15
+    block_size: 18
+    hop_size: 3
+    look_ahead:  3
+    init_average: true
+    ctx_pos_enc: true
+
+# decoder related
+decoder: transducer
+decoder_conf:
+    rnn_type: lstm
+    num_layers: 1
+    hidden_size: 512
+    dropout: 0.1
+    dropout_embed: 0.2
+
+joint_net_conf:
+    joint_space_size: 640
+
+model: turntaking_xfmr
+model_conf:
+    ctc_weight: 0.0
+    report_cer: False
+    report_wer: False
+    num_tag_classes: 3
+    tag_class_weight: [1.92, 1.0, 1.63]   # [継続, 完了, 相槌]
+    tt_head_type: selfattn
+    tt_xfmr_heads: 4
+    tt_xfmr_layers: 1
+    tt_xfmr_ff: 1024
+    tt_dropout: 0.1
+    tt_d_hidden: 128
+    report_turntaking_accuracy: True
+    tt_adapt: lora              # ★ エンコーダを勾配ありで通す（LoRA に勾配を流す）
+
+# Stage1(純粋ASR)の重みを読み込む。base 重みは freeze_param で凍結し、LoRA のみ学習。
+init_param:
+   - exp/asr_PUREASR_TAG/valid.loss.ave.pth
+freeze_param:
+   - frontend
+   - normalize
+   - encoder            # base 重みは凍結。LoRA(A,B) は create_adapter が後から追加＝学習対象
+   - decoder
+   - joint_network
+   - ctc
+
+# ★ LoRA 関連（abs_task が freeze_param の後に create_adapter で挿入）
+use_adapter: true
+adapter: lora
+save_strategy: all          # デコードで ASR も動かすため全パラメータを保存
+adapter_conf:
+    rank: 8
+    alpha: 8
+    dropout_rate: 0.05
+    target_modules:         # 各 Conformer ブロックの自己注意 Q,V に LoRA
+        - linear_q
+        - linear_v
+
+#
+frontend: default
+frontend_conf:
+    hop_length: 132
+
+# minibatch related
+batch_type: numel
+batch_bins: 700000
+valid_batch_bins: 300000
+
+seed: 30
+
+# optimization related
+accum_grad: 8
+grad_clip: 5
+patience: 10
+max_epoch: 30
+best_model_criterion:
+-   - valid
+    - loss
+    - min
+-   - valid
+    - tag_acc
+    - max
+keep_nbest_models: 10
+
+optim: adam
+optim_conf:
+    lr: 0.002
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 25000
+num_att_plot: 0
+specaug: specaug
+specaug_conf:
+    apply_time_warp: true
+    time_warp_window: 5
+    time_warp_mode: bicubic
+    apply_freq_mask: true
+    freq_mask_width_range:
+    - 0
+    - 30
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_range:
+    - 0
+    - 40
+    num_time_mask: 2

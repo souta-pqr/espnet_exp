@@ -1,0 +1,16 @@
+# =============================================================================
+# Decode Configuration for Multitask Transformer
+# =============================================================================
+# Purpose: Inference/Decoding settings for ASR + Disfluency Detection
+# Decoder: Beam search with beam width 5
+# Created: 2026-01-15
+# =============================================================================
+
+beam_size: 5  # Beam width = 5
+penalty: 0.0
+maxlenratio: 0.0
+minlenratio: 0.0
+ctc_weight: 0.3  # Same as training
+lm_weight: 0.0  # Language model weight (set to 0 if not using LM)
+normalize_length: false
+nbest: 1  # Return only best hypothesis
