@@ -1670,6 +1670,23 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
         if [ -f "${_asr_train_dir}/ctx_vec.scp" ]; then
             _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/ctx_vec.scp,ctx_vec,kaldi_ark "
         fi
+
+        # Stage2(turntaking) の過去発話入力を **学習側にも** 渡す。Stage 10（collect stats）
+        # だけに書かれていたため、これが無いと past_* がモデルに届かず、
+        # tt_past_pool を何にしても「現発話のみ」のモデルが学習されてしまう。
+        # 注) num_splits_asr > 1 の分割学習パスは past_* を分割していないため未対応。
+        if [ -f "${_asr_train_dir}/past_vec.scp" ]; then
+            _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/past_vec.scp,past_vec,kaldi_ark "
+        fi
+        if [ -f "${_asr_train_dir}/past_speech.scp" ]; then
+            _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/past_speech.scp,past_speech,concat_sound "
+        fi
+        if [ -f "${_asr_train_dir}/past_bounds.scp" ]; then
+            _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/past_bounds.scp,past_bounds,text_int "
+        fi
+        if [ -f "${_asr_train_dir}/past_text.scp" ]; then
+            _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/past_text.scp,past_text,text_int "
+        fi
     fi
 
     # shellcheck disable=SC2068
@@ -1699,6 +1716,20 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
     # Add past-context vector validation data
     if [ -f "${_asr_valid_dir}/ctx_vec.scp" ]; then
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/ctx_vec.scp,ctx_vec,kaldi_ark "
+    fi
+
+    # Stage2(turntaking) の過去発話入力（valid 側）。学習側と対で必要。
+    if [ -f "${_asr_valid_dir}/past_vec.scp" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/past_vec.scp,past_vec,kaldi_ark "
+    fi
+    if [ -f "${_asr_valid_dir}/past_speech.scp" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/past_speech.scp,past_speech,concat_sound "
+    fi
+    if [ -f "${_asr_valid_dir}/past_bounds.scp" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/past_bounds.scp,past_bounds,text_int "
+    fi
+    if [ -f "${_asr_valid_dir}/past_text.scp" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/past_text.scp,past_text,text_int "
     fi
 
     if ${use_prompt}; then
