@@ -13,6 +13,9 @@ case "${pool}" in
     utt)         pooltag="utt_k${uslots}"    ;;
     *)           pooltag="${pool}"           ;;
 esac
+# PEFT 版（run_peft_lora.sh / run_peft_adapter.sh）は tag_suffix でタグが分かれる
+tag_suffix=${tag_suffix:-}
+pooltag="${pooltag}${tag_suffix}"
 mkdir -p tt_eval_logs
 for n in $NS; do
     variant="${scope}_n${n}_p${max_past}"

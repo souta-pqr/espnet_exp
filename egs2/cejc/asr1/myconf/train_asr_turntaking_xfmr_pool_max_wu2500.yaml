@@ -55,7 +55,7 @@ model_conf:
     report_turntaking_accuracy: True
     tt_rel_pe: true        # 位置符号を相対に（圧縮系と条件をそろえる）
     tt_past_specaug: false # 過去音声には SpecAug を掛けない（同上）
-    tt_past_pool: frames   # 過去音声を符号化し pooling せず全フレームを head へ
+    tt_past_pool: max   # 過去音声を凍結Encで符号化し max pooling
 
 # Stage1(純粋ASR)の重みを読み込み、エンコーダ等は凍結（ASRは数値的に完全不変）
 init_param:
@@ -102,7 +102,7 @@ optim_conf:
     lr: 0.002
 scheduler: warmuplr     # pytorch v1.1.0+ required
 scheduler_conf:
-    warmup_steps: 25000
+    warmup_steps: 2500
 num_att_plot: 0
 specaug: specaug
 specaug_conf:
