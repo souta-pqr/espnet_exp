@@ -25,8 +25,15 @@ case "${pool}" in
     utt)         pooltag="utt_k${uslots}"    ;;
     *)           pooltag="${pool}"           ;;
 esac
-asr_tag=${asr_tag:-$(date +%Y%m%d)-turntaking-xfmr-pool_${pooltag}-${scope}_n${N}_p${max_past}}
-asr_stats_dir=exp/asr_stats_raw_jp_word_pool_${pooltag}_${variant}
+# base_cfg / tag_suffix を差し替えると PEFT 版（LoRA / Adapter）に流用できる。
+# 既定は完全凍結の pool 用 config（run_xfmr_n0.sh と同じ規約）。
+base_cfg=${base_cfg:-myconf/train_asr_turntaking_xfmr_pool_${pool}.yaml}
+tag_suffix=${tag_suffix:-}
+asr_tag=${asr_tag:-$(date +%Y%m%d)-turntaking-xfmr-pool_${pooltag}${tag_suffix}-${scope}_n${N}_p${max_past}}
+# stats は過去データと形状だけで決まるので PEFT 版とも共有する（tag_suffix を付けない）
+# tail=1 のときは tail_speech の形状も入るので別ディレクトリにする
+tail=${tail:-0}             # 1 で無音込み学習用の tail_speech.scp を配線する（tt_tail_sec>0 のモデル用）
+asr_stats_dir=${asr_stats_dir:-exp/asr_stats_raw_jp_word_pool_${pooltag}_${variant}$([ "${tail}" = "1" ] && echo _tail)}
 inference_config=${inference_config:-myconf/decode_cbs_transducer_bounded.yaml}
 
 # (1) past_speech（過去N発話の連結音声）を用意し、past_speech.scp に配置。past_vec は使わない。
@@ -44,11 +51,23 @@ for dset in "${train_set}" "${valid_set}" ${test_sets}; do
     cp "${srcb}" "dump/raw/${dset}/past_bounds.scp"
     # past_vec は無効化（誤配線防止）
     [ -f "dump/raw/${dset}/past_vec.scp" ] && mv "dump/raw/${dset}/past_vec.scp" "dump/raw/${dset}/past_vec.scp.off" || true
+    # 無音込み学習：tail=1 のときだけ tail_speech.scp を配線する（local/build_tail_audio.py で生成）。
+    # asr.sh はファイルの有無で自動的に渡すので、使わない学習では .off に退避しておく。
+    if [ "${tail}" = "1" ]; then
+        if [ ! -f "dump/raw/${dset}/tail_speech.scp" ]; then
+            [ -f "dump/raw/${dset}/tail_speech.scp.off" ] && mv "dump/raw/${dset}/tail_speech.scp.off" "dump/raw/${dset}/tail_speech.scp" \
+                || { echo "dump/raw/${dset}/tail_speech.scp がありません（local/build_tail_audio.py --dset ${dset}）"; exit 1; }
+        fi
+    else
+        [ -f "dump/raw/${dset}/tail_speech.scp" ] && mv "dump/raw/${dset}/tail_speech.scp" "dump/raw/${dset}/tail_speech.scp.off" || true
+    fi
 done
 
 # (2) init_param を Stage1 に差し替えた config を生成
-cfg=myconf/.gen_pool_${pooltag}_${variant}.yaml
-sed "s#exp/asr_PUREASR_TAG/valid.loss.ave.pth#${S1_MODEL}#" myconf/train_asr_turntaking_xfmr_pool_${pool}.yaml > "$cfg"
+cfg=myconf/.gen_pool_${pooltag}${tag_suffix}_${variant}.yaml
+sed "s#exp/asr_PUREASR_TAG/valid.loss.ave.pth#${S1_MODEL}#" "${base_cfg}" > "$cfg"
+# base_cfg を差し替えたときも過去要約が ${pool} と食い違わないようにそろえる
+sed -i "s/^    tt_past_pool:.*/    tt_past_pool: ${pool}/" "$cfg"
 case "${pool}" in
     conv)       sed -i "s/^    tt_compress_ratio: [0-9]*/    tt_compress_ratio: ${ratio}/" "$cfg" ;;
     query|topk) sed -i "s/^    tt_compress_slots: [0-9]*/    tt_compress_slots: ${slots}/" "$cfg" ;;
