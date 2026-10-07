@@ -1073,4 +1073,4 @@ class TurnTakingASRTask(DisfluencyASRTask):
     ) -> Tuple[str, ...]:
         retval = super().optional_data_names(train=train, inference=inference)
         return retval + ("tag_label", "ctx_vec", "past_speech", "past_vec",
-                         "past_text", "past_bounds")
+                         "past_text", "past_bounds", "tail_speech", "text_vec")

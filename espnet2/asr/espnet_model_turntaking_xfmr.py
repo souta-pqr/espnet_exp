@@ -71,10 +71,29 @@ class TurnTakingXfmrHead(nn.Module):
     """
 
     def __init__(self, d_model=256, head_type="selfattn", n_layers=1, n_heads=4,
-                 d_ff=1024, dropout=0.1, n_classes=3, d_hidden=128, rel_pe=False):
+                 d_ff=1024, dropout=0.1, n_classes=3, d_hidden=128, rel_pe=False,
+                 use_dec=False, time_feat=False, n_horizons=0):
         super().__init__()
         self.head_type = head_type
         self.rel_pe = rel_pe
+        self.use_dec = use_dec
+        # 先読みヘッド：読み出し位置と同じベクトルから「h_k 秒以内に完了で終わるか」を
+        # ホライズンごとに 2 値で出す（Endpoint Anticipation 型）。0 なら従来どおり無し。
+        self.n_horizons = n_horizons
+        if n_horizons > 0:
+            self.mlp_h = nn.Sequential(
+                nn.Linear(d_model, d_hidden), nn.ReLU(), nn.Dropout(dropout),
+                nn.Linear(d_hidden, n_horizons),
+            )
+        # 経過時間特徴：現発話をここまで何フレーム聞いたか（enc_lens）を読み出しに足す。
+        # 早く切るほど相槌を過剰予測する（打ち切られた長い発話が「短い＝相槌」に見える）
+        # 混同への対処。enc_lens は発話開始からの経過時間そのもので、因果的に既知。
+        # 射影を零初期化するため、学習開始時点では従来モデルと完全に同一挙動。
+        self.time_feat = time_feat
+        if time_feat:
+            self.time_proj = nn.Linear(d_model, d_model)
+            nn.init.zeros_(self.time_proj.weight)
+            nn.init.zeros_(self.time_proj.bias)
         if head_type == "selfattn":
             self.attn = nn.MultiheadAttention(
                 embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True
@@ -87,39 +106,56 @@ class TurnTakingXfmrHead(nn.Module):
             self.xfmr = nn.TransformerEncoder(layer, num_layers=n_layers)
         else:
             raise ValueError(f"unknown head_type: {head_type}")
-        # セグメント埋め込み（0=過去ベクトル, 1=現発話フレーム）
-        self.seg = nn.Embedding(2, d_model)
+        # セグメント埋め込み（0=過去ベクトル, 1=現発話フレーム, 2=デコーダ状態）
+        # use_dec=False のときは 2 のままにして、既存モデルの重みをそのまま読めるようにする。
+        self.seg = nn.Embedding(3 if use_dec else 2, d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_hidden), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(d_hidden, n_classes),
         )
 
-    def forward(self, past_vec, past_lens, enc_out, enc_lens):
-        """past_vec:(B,Np,D) padded / past_lens:(B,) / enc_out:(B,T,D) / enc_lens:(B,)"""
+    def forward(self, past_vec, past_lens, enc_out, enc_lens,
+                dec_vec=None, dec_lens=None, return_horizon=False):
+        """past_vec:(B,Np,D) / enc_out:(B,T,D) / dec_vec:(B,Nd,D) 射影済みデコーダ状態
+
+        return_horizon=True なら (タグ logits (B,C), 先読み logits (B,K)) を返す。
+
+        タグは「伝えたいことを言い終えたか」という意味・語用の判断なので、音響を担う
+        encoder 出力だけでなく、言語を担う Transducer デコーダの状態も読ませる。
+        並びは [過去 ; デコーダ状態 ; 現発話フレーム] で、読み出しは従来どおり現発話の最終位置。
+        """
         B, Np, D = past_vec.shape
         T = enc_out.shape[1]
-        seq = torch.cat([past_vec, enc_out], dim=1)                 # (B, Np+T, D)
+        Nd = dec_vec.shape[1] if dec_vec is not None else 0
+        parts = [past_vec] + ([dec_vec] if Nd else []) + [enc_out]
+        seq = torch.cat(parts, dim=1)                               # (B, Np+Nd+T, D)
 
-        # セグメント埋め込み（過去 v / 現発話 c の区別）＋ 位置符号
+        # セグメント埋め込み（過去 0 / デコーダ 2 / 現発話 1）＋ 位置符号
         seg_id = torch.cat([
             torch.zeros(B, Np, dtype=torch.long, device=seq.device),
+        ] + ([torch.full((B, Nd), 2, dtype=torch.long, device=seq.device)] if Nd else []) + [
             torch.ones(B, T, dtype=torch.long, device=seq.device),
         ], dim=1)
         seq = seq + self.seg(seg_id)
         if self.rel_pe:
             # 相対位置符号：読み出し位置（現発話の最終フレーム）からの距離で符号化する。
             # 絶対 index だと Np がバッチごとに変わり現発話の位置がずれるため。
-            readout = (Np + enc_lens.to(seq.device) - 1).clamp(min=0)      # (B,)
-            idx = torch.arange(Np + T, device=seq.device)[None, :]
-            dist = (readout[:, None] - idx).clamp(min=0)                   # (B, Np+T)
+            readout = (Np + Nd + enc_lens.to(seq.device) - 1).clamp(min=0)  # (B,)
+            idx = torch.arange(Np + Nd + T, device=seq.device)[None, :]
+            dist = (readout[:, None] - idx).clamp(min=0)                   # (B, Np+Nd+T)
             seq = seq + sinusoidal_pe_at(dist, D, seq.dtype)
         else:
-            seq = seq + sinusoidal_pe(Np + T, D, seq.device, seq.dtype)
+            seq = seq + sinusoidal_pe(Np + Nd + T, D, seq.device, seq.dtype)
 
-        # 有効位置マスク（過去は past_lens まで、現発話は enc_lens まで）
+        # 有効位置マスク（過去は past_lens、デコーダは dec_lens、現発話は enc_lens まで）
         ar_p = torch.arange(Np, device=seq.device)[None, :] < past_lens.to(seq.device)[:, None]
         ar_c = torch.arange(T, device=seq.device)[None, :] < enc_lens.to(seq.device)[:, None]
-        valid = torch.cat([ar_p, ar_c], dim=1)                      # (B, Np+T)
+        ms = [ar_p]
+        if Nd:
+            ms.append(torch.arange(Nd, device=seq.device)[None, :]
+                      < dec_lens.to(seq.device)[:, None])
+        ms.append(ar_c)
+        valid = torch.cat(ms, dim=1)                                # (B, Np+Nd+T)
 
         if self.head_type == "selfattn":
             # self-attention のみ（Q=K=V=seq）。FFN・残差・LayerNorm は入れない。
@@ -127,9 +163,16 @@ class TurnTakingXfmrHead(nn.Module):
         else:
             out = self.xfmr(seq, src_key_padding_mask=~valid)       # (B, Np+T, D)
 
-        # 現発話の最終フレーム位置（現発話は必ず index Np から始まる）
-        last = (Np + enc_lens.to(out.device) - 1).clamp(min=0, max=Np + T - 1)
+        # 現発話の最終フレーム位置（現発話は必ず index Np+Nd から始まる）
+        last = (Np + Nd + enc_lens.to(out.device) - 1).clamp(min=0, max=Np + Nd + T - 1)
         vec = out[torch.arange(B, device=out.device), last]         # (B, D)
+        if self.time_feat:
+            te = sinusoidal_pe_at(
+                enc_lens.to(out.device).unsqueeze(1), D, out.dtype)  # (B,1,D)
+            vec = vec + self.time_proj(te.squeeze(1))
+        if return_horizon:
+            hor = self.mlp_h(vec) if self.n_horizons > 0 else None
+            return self.mlp(vec), hor                               # (B, C), (B, K)
         return self.mlp(vec)                                        # (B, C)
 
 
@@ -439,6 +482,55 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
         #            forward hook で加算する（エンコーダのパラメータ名は変えない）。
         # いずれもエンコーダを勾配ありで通す（＝適応パラメータに勾配が流れる）。
         tt_adapt: str = "none",
+        # PEFT のとき、過去音声の符号化にも勾配を通すか。
+        #   false（既定）… 過去は勾配なし。凍結手法と過去の扱いが揃い、メモリも増えない
+        #   true          … 現発話と同じく勾配ありで通す。逆伝播するフレーム数が約 5.6 倍に
+        #                   なるので batch_bins を下げ accum_grad を同じ倍率で上げること
+        tt_past_grad: bool = False,
+        # ラベル平滑化。ラベルは LLM 判断（人手との F1 0.805）と規則の混合で、
+        # 曖昧な事例も確信度 1.0 で与えられる。0.0 で従来どおり。
+        tt_label_smoothing: float = 0.0,
+        # Focal loss の γ。相槌はデータの 26.8% を占めるが AUC 0.99 で既に解けており、
+        # 学習信号にならないまま勾配に寄与し続ける。γ>0 で簡単な事例を割り引き、
+        # 難しい継続/完了の境界に容量と勾配を集中させる。0.0 で通常の交差エントロピー。
+        tt_focal_gamma: float = 0.0,
+        # 早期確定用：学習時に現発話を「発話末の最大 t 秒手前」までランダムに打ち切る。
+        # ヘッドの読み出しは常に渡された音声の最終フレームなので、部分入力でも
+        # 判定できるように学習される。0 で無効（従来どおり発話全体のみ）。
+        tt_train_trunc_sec: float = 0.0,
+        # 打ち切りを適用する確率。残りは発話全体のまま学習し、t=0 の性能も保つ。
+        tt_train_trunc_prob: float = 0.5,
+        # 早期確定用：現発話の経過時間（enc_lens）を head の読み出しに明示的に足す。
+        # 打ち切り学習と併用すると「途中で切られた長い発話が相槌に見える」混同を
+        # モデル内で解けるようになる（経過時間ゲート・時刻別較正の内在化）。
+        tt_time_feat: bool = False,
+        # 無音込み学習：発話後の音声 tail_speech（元録音の [end, end+α]）を最大 t 秒、
+        # 現発話の後ろに足す。打ち切りと合わせて、現発話の切り出し位置を
+        # [end − tt_train_trunc_sec, end + tt_tail_sec] から一様に引く。
+        # 実運用で区間検出が発火するまでに聞く無音（や次の発話）を学習時に見せるため。
+        # 0 で無効（tail_speech が来ても使わない）。
+        tt_tail_sec: float = 0.0,
+        # 先読みヘッドのホライズン（秒）。各 h について「切り出し位置から h 秒以内に
+        # 現発話が <完了> で終わる（既に終わっている場合を含む）」を 2 値で学習する。
+        # 実行時は p(h) ≥ θ で確定するだけなので、閾値は時刻にもクラスにも依らない。
+        # 空なら無効。
+        tt_horizons: List[float] = [],
+        # フレーム単位学習：**波形を切らず**に符号化し、ヘッドを窓内の複数位置で読む。
+        # 波形を切ると切断端が境界として処理され、実運用のストリーミングには
+        # 生じない「ここで音声が途切れた」信号が入る（同じ絶対位置の表現は
+        # 後続 6 フレームで確定することを実測済み）。0 で無効（従来の打ち切り学習）。
+        # 認識結果テキストの BERT 表現を head に渡して共同学習する。
+        # 後段で確率を平均する方式（AUC +0.024）に対し、表現の段階で混ぜる。
+        # **発話全体の認識結果**の表現なので発話途中では手に入らない。
+        # 読み出し位置が発話末より前のときはモデル側でマスクし、音声のみで判定する。
+        tt_use_text: bool = False,
+        tt_text_dim: int = 768,
+        tt_frame_readouts: int = 0,
+        # 読み出し位置を引く窓。発話末の tt_frame_win_sec 秒手前から、
+        # 発話末＋tt_tail_sec 秒後まで（tail_speech がある場合）。
+        tt_frame_win_sec: float = 0.6,
+        tt_horizon_weight: float = 1.0,      # 先読み BCE の重み λ
+        tt_horizon_pos_weight: float = 1.0,  # 正例（h 秒以内に完了）の重み
         # 過去発話の要約方法。"none"=事前計算 past_vec を使う（既定・従来）／
         # "max"/"attn"=過去音声 past_speech を凍結エンコーダで符号化し max/attn pooling で1本に要約／
         # "frames"=過去音声を符号化し **pooling せず全フレーム**を self-attention に入れる（圧縮しない要約）／
@@ -465,6 +557,11 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
         # True で過去発話を **テキスト**（past_text のトークン列）で入れる。
         # Stage1 の Transducer デコーダ埋め込み（凍結）で埋め込み → 256次元へ射影して head に渡す。
         tt_past_text: bool = False,
+        # True で **Transducer デコーダの状態**をタグヘッドに渡す。
+        # タグ（伝えたいことを言い終えたか）は意味・語用の判断であり、それを担うのは
+        # 音響の encoder ではなく言語モデル的に働くデコーダ。ASR で既に計算済みなので
+        # 追加の計算コストはほぼ無い。凍結したまま状態だけを線形射影して読ませる。
+        tt_use_dec: bool = False,
         tt_adapter_bottleneck: int = 32,
         tt_adapter_dropout: float = 0.0,
         # Adapter を挿す FFN。既定は各ブロックの主 FFN のみ（12 箇所, Pfeiffer 型）。
@@ -492,6 +589,31 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
         self.num_tag_classes = num_tag_classes
         self.report_turntaking_accuracy = report_turntaking_accuracy
         self.tt_adapt = tt_adapt  # "none" | "lora" | "houlsby"
+        self.tt_past_grad = tt_past_grad
+        self.tt_label_smoothing = float(tt_label_smoothing)
+        self.tt_focal_gamma = float(tt_focal_gamma)
+        self.tt_train_trunc_sec = float(tt_train_trunc_sec)
+        self.tt_train_trunc_prob = float(tt_train_trunc_prob)
+        self.tt_tail_sec = float(tt_tail_sec)
+        self.tt_use_text = bool(tt_use_text)
+        if self.tt_use_text:
+            self.text_proj = nn.Linear(int(tt_text_dim), encoder.output_size())
+            logging.info(f"[turntaking_xfmr] 認識結果テキストの BERT 表現を head へ "
+                         f"({tt_text_dim} → {encoder.output_size()})、発話末以降のみ有効")
+        self.tt_frame_readouts = int(tt_frame_readouts)
+        self.tt_frame_win_sec = float(tt_frame_win_sec)
+        if self.tt_frame_readouts > 0:
+            logging.info(
+                f"[turntaking_xfmr] フレーム単位学習: 読み出し {self.tt_frame_readouts} 点 / "
+                f"窓 −{self.tt_frame_win_sec}s 〜 +{self.tt_tail_sec}s（波形は切らない）")
+        self.tt_horizons = [float(h) for h in tt_horizons]
+        self.tt_horizon_weight = float(tt_horizon_weight)
+        self.tt_horizon_pos_weight = float(tt_horizon_pos_weight)
+        if self.tt_tail_sec > 0:
+            logging.info(f"[turntaking_xfmr] 無音込み学習: 発話後 最大 {self.tt_tail_sec} 秒を付加")
+        if self.tt_horizons:
+            logging.info(f"[turntaking_xfmr] 先読みヘッド: horizons={self.tt_horizons} "
+                         f"(λ={self.tt_horizon_weight}, pos_weight={self.tt_horizon_pos_weight})")
         if tag_class_weight is not None:
             self.register_buffer(
                 "tag_class_weight", torch.tensor(tag_class_weight, dtype=torch.float)
@@ -503,8 +625,18 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
             d_model=encoder.output_size(), head_type=tt_head_type,
             n_layers=tt_xfmr_layers, n_heads=tt_xfmr_heads, d_ff=tt_xfmr_ff,
             dropout=tt_dropout, n_classes=num_tag_classes, d_hidden=tt_d_hidden,
-            rel_pe=tt_rel_pe,
+            rel_pe=tt_rel_pe, use_dec=(tt_use_dec or tt_use_text),
+            time_feat=tt_time_feat, n_horizons=len(self.tt_horizons),
         )
+        if tt_time_feat:
+            logging.info("[turntaking_xfmr] 経過時間特徴を head に追加（零初期化射影）")
+        self.tt_use_dec = tt_use_dec
+        if tt_use_dec:
+            self.dec_proj = nn.Linear(decoder.dunits, encoder.output_size())
+            logging.info(
+                f"[turntaking_xfmr] デコーダ状態を head に接続 "
+                f"({decoder.dunits} → {encoder.output_size()})"
+            )
         self.tt_past_specaug = tt_past_specaug
         if tt_rel_pe:
             logging.info("[turntaking_xfmr] head 位置符号 = 相対（読み出し位置からの距離）")
@@ -638,6 +770,48 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
             enc_out = enc_out[0]
         return enc_out, enc_lens
 
+    def _encode_past(self, past_speech, past_speech_lengths):
+        """過去音声のエンコーダ出力を得る。現発話側 _frozen_encode と同じ規約。
+
+        勾配を通すのは tt_adapt != "none" かつ tt_past_grad=True のときだけ。
+        既定（tt_past_grad=False）では過去は常に勾配なしで、凍結手法と扱いが揃う。
+
+        encode() は self.training を見て SpecAug を掛ける。過去は「記憶」なので、
+        tt_past_specaug=False のときだけ一時的に外して符号化する。
+        """
+        sa = self.specaug
+        if not self.tt_past_specaug:
+            self.specaug = None
+        try:
+            if self.tt_adapt == "none" or not self.tt_past_grad:
+                with torch.no_grad():
+                    p_out, p_lens = self.encode(past_speech, past_speech_lengths)
+                    if isinstance(p_out, tuple):
+                        p_out = p_out[0]
+                    return p_out.detach(), p_lens
+            p_out, p_lens = self.encode(past_speech, past_speech_lengths)
+            if isinstance(p_out, tuple):
+                p_out = p_out[0]
+            return p_out, p_lens
+        finally:
+            self.specaug = sa
+
+    def _decoder_states(self, text, text_lengths, dtype):
+        """Transducer デコーダを凍結のまま通し、状態列を head の次元へ射影する。
+
+        入力は [blank ; トークン列]（ASR 学習時の decoder_in と同じ並び）。
+        返り値: (B, U+1, D_enc) と有効長 (B,)。
+        """
+        tok = text.clamp(min=0).long()                        # パディング(-1)は 0 扱い
+        blank = tok.new_full((tok.size(0), 1), self.blank_id)
+        dec_in = torch.cat([blank, tok], dim=1)               # (B, U+1)
+        with torch.no_grad():
+            self.decoder.set_device(dec_in.device)
+            dec_out = self.decoder(dec_in).detach()           # (B, U+1, dunits)
+        dec_vec = self.dec_proj(dec_out.to(dtype))            # (B, U+1, D_enc)
+        dec_lens = (text_lengths.to(dec_in.device) + 1).clamp(max=dec_in.size(1))
+        return dec_vec, dec_lens
+
     def forward(
         self,
         speech: torch.Tensor,
@@ -654,9 +828,75 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
         past_text_lengths: Optional[torch.Tensor] = None,
         past_bounds: Optional[torch.Tensor] = None,
         past_bounds_lengths: Optional[torch.Tensor] = None,
+        tail_speech: Optional[torch.Tensor] = None,
+        tail_speech_lengths: Optional[torch.Tensor] = None,
+        text_vec: Optional[torch.Tensor] = None,
+        text_vec_lengths: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
         batch_size = speech.shape[0]
+
+        # 0. 早期確定用のランダム打ち切り（学習時のみ・現発話だけ・過去は不変）。
+        #    波形は切らず長さだけ縮める。encode() は長さを尊重し、head は enc_lens の
+        #    位置で読み出すので、これで「途中まで聞いた状態」を再現できる。
+        #    tt_tail_sec > 0 のときは発話後の音声 tail_speech も後ろに足し、切り出し位置を
+        #    [end − trunc_sec, end + tail_sec] から一様に引く（負＝発話途中、正＝無音込み）。
+        #    time_to_end（切り出し位置から発話末までの秒数、末尾以降は 0）は先読みヘッドの
+        #    正解を作るのに使う。
+        time_to_end = torch.zeros(batch_size, device=speech_lengths.device)
+        use_tail = (self.tt_tail_sec > 0 and tail_speech is not None
+                    and tail_speech_lengths is not None)
+
+        # 0'. フレーム単位学習：**波形は切らず**、tail を後ろに足して 1 回だけ符号化し、
+        #     ヘッドを窓内の複数位置で読む。波形を切ると切断端が境界として処理され、
+        #     実運用のストリーミングには生じない「音声が途切れた」信号が入るため。
+        # 検証も学習と同じ条件で測る（早期終了の基準を学習条件に合わせるため）。
+        # 学習では窓内からランダムに引き、検証では等間隔に置いて毎回同じ値にする。
+        frame_mode = self.tt_frame_readouts > 0
+        seg_lengths = speech_lengths
+        if frame_mode and use_tail:
+            tl = tail_speech_lengths.to(speech_lengths.device)
+            add = tl.clamp(max=int(self.tt_tail_sec * 16000))
+            L = int((speech_lengths + add).max())
+            ext = speech.new_zeros(batch_size, L)
+            ext[:, : speech.shape[1]] = speech
+            for i in range(batch_size):
+                a = int(add[i])
+                if a > 0:
+                    s0 = int(speech_lengths[i])
+                    ext[i, s0 : s0 + a] = tail_speech[i, :a].to(ext.dtype)
+            speech = ext
+            speech_lengths = speech_lengths + add
+
+        if (not frame_mode) and self.training and (self.tt_train_trunc_sec > 0 or use_tail):
+            dev = speech_lengths.device
+            keep_min = 4000                                   # 0.25 秒（評価側の下限と同じ）
+            apply = torch.rand(batch_size, device=dev) < self.tt_train_trunc_prob
+            lo = -self.tt_train_trunc_sec * 16000
+            hi = (self.tt_tail_sec * 16000) if use_tail else 0.0
+            offs = (lo + torch.rand(batch_size, device=dev) * (hi - lo)).long()
+            offs = torch.where(apply, offs, torch.zeros_like(offs))
+            if use_tail:
+                tail_lens = tail_speech_lengths.to(dev)
+                offs = torch.minimum(offs, tail_lens)          # tail の実長を超えない
+                add = offs.clamp(min=0)                        # 足す tail のサンプル数
+                if int(add.max()) > 0:
+                    L = speech.shape[1] + int(add.max())
+                    ext = speech.new_zeros(batch_size, L)
+                    ext[:, : speech.shape[1]] = speech
+                    for i in range(batch_size):
+                        a = int(add[i])
+                        if a > 0:
+                            s0 = int(speech_lengths[i])
+                            ext[i, s0 : s0 + a] = tail_speech[i, :a].to(ext.dtype)
+                    speech = ext
+            else:
+                offs = offs.clamp(max=0)
+            new_len = speech_lengths + offs
+            new_len = torch.maximum(new_len, torch.minimum(
+                speech_lengths, torch.full_like(speech_lengths, keep_min)))
+            time_to_end = (speech_lengths - new_len).clamp(min=0).float() / 16000.0
+            speech_lengths = new_len
 
         # 1. 凍結エンコーダ（現発話・pooling しない）
         enc_out, enc_lens = self._frozen_encode(speech, speech_lengths)
@@ -665,19 +905,7 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
         # 2a. 過去音声を凍結エンコーダで符号化して過去表現を作る（pooling / 全フレーム）
         if (self.tt_past_pool in ("max", "attn", "frames", "conv", "query", "topk", "utt")
                 and past_speech is not None):
-            with torch.no_grad():
-                # encode() は self.training を見て SpecAug を掛ける。過去は「記憶」なので、
-                # tt_past_specaug=False のときだけ一時的に外して符号化する（現発話には掛かる）。
-                sa = self.specaug
-                if not self.tt_past_specaug:
-                    self.specaug = None
-                try:
-                    p_out, p_lens = self.encode(past_speech, past_speech_lengths)
-                finally:
-                    self.specaug = sa
-                if isinstance(p_out, tuple):
-                    p_out = p_out[0]
-                p_out = p_out.detach()
+            p_out, p_lens = self._encode_past(past_speech, past_speech_lengths)
             p_lens = p_lens.to(p_out.device)
             if self.tt_past_pool == "frames":
                 # pooling なし：過去の全フレームをそのまま渡す
@@ -730,20 +958,99 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
                                 device=enc_out.device)
             )
 
+        # 2c. Transducer デコーダの状態（言語側の要約）。デコーダは凍結なので no_grad で通し、
+        #     学習するのは射影 dec_proj と head だけ。学習時は正解トークン、推論時は
+        #     ASR 仮説のトークンを与える（評価スクリプト側で切り替える）。
+        dec_vec = dec_lens = None
+        if self.tt_use_dec:
+            dec_vec, dec_lens = self._decoder_states(text, text_lengths, enc_out.dtype)
+        elif self.tt_use_text and text_vec is not None:
+            tv = text_vec
+            if tv.dim() == 3:                      # (B,1,768) で来ることがある
+                tv = tv[:, 0]
+            dec_vec = self.text_proj(tv.to(enc_out.dtype)).unsqueeze(1)   # (B,1,D)
+            dec_lens = torch.ones(B, dtype=torch.long, device=enc_out.device)
+
         # 3. Transformer → 現発話の最終フレーム位置 → MLP
-        tag_logits = self.turntaking_head(past_vec, past_lens, enc_out, enc_lens)
+        #    frame_mode では、窓内の複数位置で読み出して損失を平均する。
+        #    ヘッドは enc_lens までのフレームしか見ないので、位置 p で読むことは
+        #    「時刻 p までしか聞いていない」状態と同じになる（推論時と同じ扱い）。
+        frame_logits = None
+        if frame_mode:
+            fps = enc_lens.float() / speech_lengths.float().clamp(min=1)
+            end_f = (seg_lengths.float() * fps).round().long().clamp(
+                min=1, max=int(enc_lens.max()))
+            lo = (end_f - int(round(self.tt_frame_win_sec * 16000
+                                    * float(fps.mean())))).clamp(min=1)
+            hi = enc_lens.clamp(min=1)
+            K = self.tt_frame_readouts
+            if self.training:
+                r = torch.rand(K - 1, batch_size, device=enc_out.device)
+            else:                       # 検証は等間隔（毎回同じ値になる）
+                r = torch.linspace(0.0, 1.0, K - 1, device=enc_out.device)[:, None] \
+                    .expand(K - 1, batch_size)
+            pos = (lo[None, :].float()
+                   + r * (hi - lo)[None, :].float().clamp(min=0)).long()
+            pos = torch.cat([end_f[None, :], pos], 0).clamp(min=1)
+            pos = torch.minimum(pos, enc_lens[None, :])
+            # 読み出しが発話末より前の位置では、その時点で認識結果は確定していない。
+            # dec_lens を 0 にしてテキストを見せない（音声のみで判定する条件になる）。
+            frame_logits = []
+            for k in range(K):
+                dl = dec_lens
+                if dl is not None and self.tt_use_text:
+                    dl = (pos[k] >= end_f).long()
+                frame_logits.append(
+                    self.turntaking_head(past_vec, past_lens, enc_out, pos[k],
+                                         dec_vec, dl))
+            tag_logits = frame_logits[0]          # 発話末での読み出し（報告用）
+            hor_logits = None
+        else:
+            tag_logits, hor_logits = self.turntaking_head(
+                past_vec, past_lens, enc_out, enc_lens, dec_vec, dec_lens,
+                return_horizon=True)
 
         stats: Dict[str, torch.Tensor] = {}
         loss_tag = torch.tensor(0.0, device=enc_out.device)
+        loss_hor = torch.tensor(0.0, device=enc_out.device)
         tag_acc = 0.0
         if tag_label is not None:
             label = (tag_label[:, 0] if tag_label.dim() == 2 else tag_label).long()
-            loss_tag = F.cross_entropy(tag_logits, label, weight=self.tag_class_weight)
+            if hor_logits is not None:
+                # 先読み：切り出し位置から h 秒以内に <完了>(=1) で終わるか。
+                # 発話全体・無音込み（time_to_end=0）の完了は全ホライズンで正例。
+                h = torch.tensor(self.tt_horizons, device=enc_out.device)
+                y_h = ((label == 1)[:, None] & (time_to_end[:, None] <= h[None, :])).float()
+                pw = torch.full_like(h, self.tt_horizon_pos_weight)
+                loss_hor = F.binary_cross_entropy_with_logits(
+                    hor_logits, y_h, pos_weight=pw)
+            # ラベルは LLM の判断（人手との F1 0.805）と規則の混合で、曖昧な事例も
+            # 確信度 1.0 で与えられる。label smoothing はその暗記を妨げる。
+            # 0 で従来どおりのハードターゲット。
+            if self.tt_focal_gamma > 0:
+                # Focal loss: 重み付き CE に (1-p_t)^γ を掛けて簡単な事例を割り引く。
+                # クラス重みは CE と同じものを使い、平均も重み付きで取る（CE と整合）。
+                logp = F.log_softmax(tag_logits, dim=-1)
+                lp = logp.gather(1, label[:, None]).squeeze(1)          # (B,)
+                pt = lp.exp()
+                w = self.tag_class_weight[label] if self.tag_class_weight is not None \
+                    else torch.ones_like(pt)
+                loss_tag = (w * (1 - pt).pow(self.tt_focal_gamma) * (-lp)).sum() / w.sum()
+            elif frame_logits is not None:
+                loss_tag = sum(
+                    F.cross_entropy(lg, label, weight=self.tag_class_weight,
+                                    label_smoothing=self.tt_label_smoothing)
+                    for lg in frame_logits) / len(frame_logits)
+            else:
+                loss_tag = F.cross_entropy(tag_logits, label, weight=self.tag_class_weight,
+                                           label_smoothing=self.tt_label_smoothing)
             tag_acc = (tag_logits.argmax(-1) == label).float().mean().item()
 
-        # 4. ASR は凍結済み＝学習しない（総損失は区間末のみ）
-        loss = loss_tag
+        # 4. ASR は凍結済み＝学習しない（総損失は区間末 ＋ 先読み）
+        loss = loss_tag + self.tt_horizon_weight * loss_hor
         stats["loss_tag"] = loss_tag.detach()
+        if hor_logits is not None:
+            stats["loss_hor"] = loss_hor.detach()
         if self.report_turntaking_accuracy:
             stats["tag_acc"] = tag_acc
         stats["loss"] = loss.detach()
