@@ -1,0 +1,13 @@
+beam_size: 20
+nbest: 5                   # asr_inference 側の切り詰め。これだけでは transducer に届かない
+lm_weight: 0.0
+penalty: 0.0
+maxlenratio: 0.0
+minlenratio: 0.0
+transducer_conf:
+    search_type: alsd       # 出力長を u_max で上限化＝1発話でのシンボル無限生成（メモリ暴走）を防ぐ
+    u_max: 50               # 最大出力トークン長。短い発話でも有界ループで必ず終了
+    score_norm: True
+    nbest: 5                # BeamSearchTransducer 自前の nbest。
+                            # トップレベルの --nbest は **transducer_conf 経由でしか
+                            # 届かないので、ここに書かないと候補が 1 本しか返らない。
