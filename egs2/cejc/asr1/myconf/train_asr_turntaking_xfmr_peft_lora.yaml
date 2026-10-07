@@ -1,0 +1,136 @@
+# PEFT 版: 過去要約は pool 系と共通（既定 attn）。エンコーダを部分適応する点だけが違う。
+#   注意: エンコーダが適応するため ASR の CER は Stage1 と同一ではなくなる（劣化量を計測する）。
+#   過去要約の種類は run_xfmr_pool.sh が pool= に合わせて tt_past_pool を書き換える。
+
+# encoder related
+encoder: contextual_block_conformer    # contextual_block_conformer is the core of streaming conformer
+encoder_conf:
+    output_size: 256    # dimension of attention
+    attention_heads: 4
+    linear_units: 2048  # the number of units of position-wise feed forward
+    num_blocks: 12     # the number of encoder blocks
+    dropout_rate: 0.1
+    positional_dropout_rate: 0.1
+    attention_dropout_rate: 0.0
+    input_layer: conv2d # encoder architecture type
+    normalize_before: true
+    activation_type: swish
+    macaron_style: true
+    use_cnn_module: true
+    cnn_module_kernel: 15
+    block_size: 18      # streaming configuration
+    hop_size: 3         # streaming configuration
+    look_ahead:  3      # streaming configuration
+    init_average: true  # streaming configuration
+    ctx_pos_enc: true   # streaming configuration
+
+# decoder related
+decoder: transducer
+decoder_conf:
+    rnn_type: lstm
+    num_layers: 1
+    hidden_size: 512
+    dropout: 0.1
+    dropout_embed: 0.2
+
+joint_net_conf:
+    joint_space_size: 640
+
+# model: turn-taking マルチタスク (espnet2.asr.espnet_model_turntaking)
+model: turntaking_xfmr
+model_conf:
+    ctc_weight: 0.0
+    report_cer: False
+    report_wer: False
+    num_tag_classes: 3
+    tag_class_weight: [1.92, 1.0, 1.63]   # [継続, 完了, 相槌]
+    tt_head_type: selfattn      # self-attention 1層のみ（FFN/残差/LayerNorm なし）
+    tt_xfmr_heads: 4            # self-attention のヘッド数
+    tt_xfmr_layers: 1           # transformer を選ぶ場合の層数（selfattn では未使用）
+    tt_xfmr_ff: 1024            # 同上
+    tt_dropout: 0.1
+    tt_d_hidden: 128
+    report_turntaking_accuracy: True
+    tt_rel_pe: true        # 位置符号を相対に（圧縮系と条件をそろえる）
+    tt_past_specaug: false # 過去音声には SpecAug を掛けない（同上）
+    tt_past_pool: attn   # 過去音声を凍結Encで符号化し attn pooling
+    tt_compress_ratio: 8   # pool=conv の圧縮率 c
+    tt_compress_slots: 8   # pool=query / topk のスロット数 M
+    tt_utt_slots: 1        # pool=utt の 1 発話あたりスロット数 k
+    tt_compress_fn: max    # pool=conv / utt の要約関数
+    tt_adapt: lora              # エンコーダを勾配ありで通す（LoRA に勾配を流す）
+
+# Stage1(純粋ASR)の重みを読み込む。base 重みは freeze_param で凍結し、適応パラメータのみ学習。
+init_param:
+   - exp/asr_PUREASR_TAG/valid.loss.ave.pth
+freeze_param:
+   - frontend
+   - normalize
+   - encoder
+   - decoder
+   - joint_network
+   - ctc
+
+#
+frontend: default
+frontend_conf:
+    hop_length: 132
+
+# minibatch related
+batch_type: numel
+batch_bins: 700000 # 800000 -> 700000
+valid_batch_bins: 300000  # 400000 -> 300000
+
+# seed setting
+seed: 30 # epoch 42
+
+# optimization related
+accum_grad: 8
+grad_clip: 5
+patience: 10
+max_epoch: 30    # Transformer+MLP のみ学習＝収束が速い
+# cer_transducer は valid ビームサーチ無効化に伴い使えないため、ビームサーチ不要な指標へ変更。
+# valid.loss.best.pth（ASR寄り・総損失）と valid.tag_acc.best.pth（区間末ベスト）の両方を保存する。
+best_model_criterion:
+-   - valid
+    - loss
+    - min
+-   - valid
+    - tag_acc
+    - max
+keep_nbest_models: 10
+
+optim: adam
+optim_conf:
+    lr: 0.002
+scheduler: warmuplr     # pytorch v1.1.0+ required
+scheduler_conf:
+    warmup_steps: 25000
+num_att_plot: 0
+specaug: specaug
+specaug_conf:
+    apply_time_warp: true
+    time_warp_window: 5
+    time_warp_mode: bicubic
+    apply_freq_mask: true
+    freq_mask_width_range:
+    - 0
+    - 30
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_range:
+    - 0
+    - 40
+    num_time_mask: 2
+
+# LoRA 関連（abs_task が freeze_param の後に create_adapter で挿入）
+use_adapter: true
+adapter: lora
+save_strategy: all          # デコードで ASR も動かすため全パラメータを保存
+adapter_conf:
+    rank: 8
+    alpha: 8
+    dropout_rate: 0.05
+    target_modules:         # 各 Conformer ブロックの自己注意 Q,V に LoRA
+        - linear_q
+        - linear_v
