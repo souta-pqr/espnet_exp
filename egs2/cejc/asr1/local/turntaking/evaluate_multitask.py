@@ -9,6 +9,7 @@ macro-F1・no/yes 二値分離を出す。早期確定（SPRT/TEASER）は使わ
 --ctx_scp で ctx_vec.scp を渡す。
 """
 import argparse
+import math
 from collections import defaultdict
 from pathlib import Path
 
@@ -83,7 +84,8 @@ def predict_utt_xfmr(model, wav, device, past_mat, return_prob=False):
 
 
 @torch.no_grad()
-def predict_utt_xfmr_pool(model, wav, past_wav, device, past_bounds=None):
+def predict_utt_xfmr_pool(model, wav, past_wav, device, past_bounds=None,
+                          return_prob=False, dec_ids=None):
     """過去音声 past_wav を凍結エンコーダで符号化し、指定の圧縮で要約 → head。
 
     past_bounds は連結した各過去発話のサンプル数（tt_past_pool="utt" のときのみ使う）。
@@ -93,15 +95,25 @@ def predict_utt_xfmr_pool(model, wav, past_wav, device, past_bounds=None):
     eo = enc[0][0] if isinstance(enc[0], tuple) else enc[0]
     el = enc[1]
     D = eo.shape[-1]
-    # 過去音声が短すぎると Conformer の畳み込みが通らない（無音のみ＝過去なし等）。
-    # 十分長い場合のみ符号化し、失敗/短い場合は過去なし扱い。
+    # 学習時は短い過去もミニバッチ内でパディングされて必ず符号化される（長さはマスクで扱う）。
+    # 単発推論では入力が短いと Conformer の畳み込み・ブロック処理が通らないため、
+    # **最小長までゼロ詰めしつつ長さは真値を渡す**ことで学習時と同じ条件にする。
+    # （以前は 0.25s 未満を「過去なし」に落としていて train/eval が食い違っていた）
+    # encode() は渡した長さで波形を切るため、長さに真値を渡すとパディングが消えてしまう。
+    # 学習時と同じ「パディングごと符号化し、有効フレーム数だけを使う」形にする。
+    MIN_PAST = 16000        # 1 s（block_size 18 フレーム ≒ 0.6 s を確実に上回る長さ）
     po = None
-    if past_wav is not None and len(past_wav) >= 4000:      # 0.25s 以上
+    if past_wav is not None and len(past_wav) > 0:
+        n = len(past_wav)
+        pw = past_wav if n >= MIN_PAST else np.pad(past_wav, (0, MIN_PAST - n))
         try:
-            px = torch.from_numpy(past_wav.astype(np.float32)).unsqueeze(0).to(device)
-            penc = model.encode(px, torch.tensor([px.shape[1]], device=device))
+            px = torch.from_numpy(pw.astype(np.float32)).unsqueeze(0).to(device)
+            penc = model.encode(px, torch.tensor([len(pw)], device=device))
             po = penc[0][0] if isinstance(penc[0], tuple) else penc[0]
-            pl_frames = penc[1].to(po.device)
+            # 有効フレーム数 = 真の長さ相当（ゼロ詰め部分は捨てる）
+            fps = penc[1].item() / float(len(pw))            # フレーム/サンプル
+            nf = max(1, min(int(math.ceil(n * fps)), po.shape[1]))
+            pl_frames = torch.tensor([nf], dtype=torch.long, device=po.device)
         except Exception:
             po = None
     if po is None:
@@ -124,7 +136,21 @@ def predict_utt_xfmr_pool(model, wav, past_wav, device, past_bounds=None):
         else:
             pooled = model.past_attn_pool(po, pl_frames)
             pv = pooled.unsqueeze(1); pl = torch.ones(1, dtype=torch.long, device=eo.device)
-    return int(model.turntaking_head(pv, pl, eo, el)[0].argmax())
+    # tt_use_dec: Transducer デコーダ状態を head へ。学習時は正解トークンだが、
+    # 推論時は ASR 仮説のトークン列を渡すのが実運用に即した条件（--dec_text_scp）。
+    dv = dl = None
+    if getattr(model, "tt_use_dec", False):
+        ids = dec_ids or []
+        t = torch.tensor([ids], dtype=torch.long, device=eo.device)
+        dv, dl = model._decoder_states(t, torch.tensor([len(ids)], device=eo.device),
+                                       eo.dtype)
+    logits, hor = model.turntaking_head(pv, pl, eo, el, dv, dl, return_horizon=True)
+    if return_prob:
+        prob = logits[0].softmax(-1).cpu().numpy()
+        # 先読みヘッド（tt_horizons）があれば各 h の「h 秒以内に完了で終わる」確率も返す
+        ph = hor[0].sigmoid().cpu().numpy() if hor is not None else np.zeros(0)
+        return int(logits[0].argmax()), prob, ph
+    return int(logits[0].argmax())
 
 
 @torch.no_grad()
@@ -142,6 +168,115 @@ def predict_utt_xfmr_text(model, wav, past_ids, device):
         pv = model.past_text_proj(emb)
         pl = torch.tensor([len(past_ids)], dtype=torch.long, device=eo.device)
     return int(model.turntaking_head(pv, pl, eo, el)[0].argmax())
+
+
+@torch.no_grad()
+def eval_frame_level(model, wav_scp, tags, args):
+    """1 回の符号化で、現発話の**全フレーム位置**での判定をまとめて出す。
+
+    これまでの前向きグリッドは、時刻ごとに波形を切って符号化し直していた。
+    しかしエンコーダはストリーミング（contextual block）なので、
+    **同じ絶対位置の表現は後続を 6 フレーム（約 0.2 秒）与えた時点で完全に確定する**
+    （実測 cos 類似 1.000）。つまり長い音声を 1 回符号化して位置 p を読めば、
+    実際のストリーミングが時刻 p に持っている表現と一致する。
+
+    一方、波形を切る方式は切った端が**境界として処理される**ため、
+    同じ時刻でも表現が変わる（cos 類似 0.46）。
+    実運用では発話の途中に境界は生じないので、こちらの方式のほうが実態に近い。
+
+    出力は 1 行 = (区間, 位置)。elapsed は発話開始からの経過秒。
+    """
+    full_map, seg_map = {}, {}
+    for line in open(args.full_wav_scp):
+        q = line.split(maxsplit=1)
+        if len(q) == 2:
+            full_map[q[0]] = q[1].strip()
+    for line in open(args.segments):
+        q = line.split()
+        if len(q) == 4:
+            seg_map[q[0]] = (q[1], float(q[2]), float(q[3]))
+    past_map = {}
+    if args.past_speech_scp:
+        for line in open(args.past_speech_scp):
+            q = line.split()
+            if len(q) >= 2:
+                past_map[q[0]] = q[1:]
+    utts = [u for u in wav_scp if u in tags and u in seg_map]
+    if args.max_utts > 0:
+        utts = utts[: args.max_utts]
+    keep = int(args.frame_max_sec * 16000)
+
+    f = open(args.dump_preds, "w", encoding="utf-8")
+    f.write("utt\ttrue\tpos\telapsed\tp_cont\tp_end\tp_bc\n")
+    n_done = n_skip = 0
+    for u in utts:
+        rec, b, e = seg_map[u]
+        if rec not in full_map:
+            n_skip += 1; continue
+        try:                      # 発話開始から frame_max_sec 秒ぶんを元録音から読む
+            wav = sf.read(full_map[rec], dtype="float32",
+                          start=int(b * 16000), frames=keep, always_2d=False)[0]
+        except Exception:
+            n_skip += 1; continue
+        if wav.ndim > 1:
+            wav = wav[:, 0]
+        if len(wav) < 3200:
+            n_skip += 1; continue
+        x = torch.from_numpy(wav).unsqueeze(0).to(args.device)
+        enc = model.encode(x, torch.tensor([len(wav)], device=args.device))
+        eo = enc[0][0] if isinstance(enc[0], tuple) else enc[0]
+        F = int(enc[1].item()); D = eo.shape[-1]
+        sec_per_frame = (len(wav) / 16000.0) / F
+
+        # 過去発話（従来と同じ扱い）
+        pv = eo.new_zeros(1, 0, D)
+        pl = torch.zeros(1, dtype=torch.long, device=eo.device)
+        paths = past_map.get(u)
+        if paths:
+            arrs = []
+            for pp in paths:
+                try:
+                    a, _ = sf.read(pp, dtype="float32", always_2d=False)
+                    if a.ndim > 1: a = a[:, 0]
+                    arrs.append(a)
+                except Exception:
+                    pass
+            cat = np.concatenate(arrs) if len(arrs) > 1 else (arrs[0] if arrs else None)
+            if cat is not None and len(cat) >= 320:
+                MIN_PAST = 16000
+                pw = cat if len(cat) >= MIN_PAST else np.pad(cat, (0, MIN_PAST - len(cat)))
+                px = torch.from_numpy(pw.astype(np.float32)).unsqueeze(0).to(args.device)
+                penc = model.encode(px, torch.tensor([len(pw)], device=args.device))
+                po = penc[0][0] if isinstance(penc[0], tuple) else penc[0]
+                fps = penc[1].item() / float(len(pw))
+                nf = max(1, min(int(math.ceil(len(cat) * fps)), po.shape[1]))
+                plf = torch.tensor([nf], dtype=torch.long, device=po.device)
+                if model.tt_past_pool == "max":
+                    msk = torch.arange(po.shape[1], device=po.device)[None, :] >= plf[:, None]
+                    pooled = po.masked_fill(msk.unsqueeze(-1), float("-inf")).max(dim=1).values
+                else:
+                    pooled = model.past_attn_pool(po, plf)
+                pv = pooled.unsqueeze(1)
+                pl = torch.ones(1, dtype=torch.long, device=eo.device)
+
+        # 全位置をバッチ次元に展開して head を 1 回だけ呼ぶ
+        lens = torch.arange(1, F + 1, device=eo.device)
+        eo_b = eo.expand(F, -1, -1)
+        pv_b = pv.expand(F, -1, -1) if pv.shape[1] > 0 else pv.new_zeros(F, 0, D)
+        pl_b = pl.expand(F)
+        out = model.turntaking_head(pv_b, pl_b, eo_b, lens)
+        prob = out.softmax(-1).cpu().numpy()
+        for i in range(F):
+            el = (i + 1) * sec_per_frame
+            if el > args.frame_max_sec + 1e-6:
+                break
+            f.write(f"{u}\t{tags[u]}\t{i}\t{el:.4f}"
+                    f"\t{prob[i,0]:.6f}\t{prob[i,1]:.6f}\t{prob[i,2]:.6f}\n")
+        n_done += 1
+        if n_done % 1000 == 0:
+            print(f"  ...{n_done} 区間", flush=True)
+    f.close()
+    print(f"処理: {n_done} (skip={n_skip}) → {args.dump_preds}")
 
 
 def eval_xfmr_text(model, wav_scp, tags, args):
@@ -179,8 +314,18 @@ def eval_xfmr_text(model, wav_scp, tags, args):
     report(preds, labels)
 
 
-def eval_xfmr_pool(model, wav_scp, tags, args):
+def eval_xfmr_pool(model, wav_scp, tags, args, token_list=None):
     """past_speech.scp（1行に過去発話の音声パスを空白区切り）を読み、max/attn pooling で評価。"""
+    # tt_use_dec 用のトークン列。--dec_text_scp に ASR 仮説 text を渡すのが実運用条件、
+    # data/<set>/text（正解）を渡すと理想カスケード相当の上限が測れる。
+    dec_map = {}
+    if args.dec_text_scp and token_list:
+        w2i = {w: i for i, w in enumerate(token_list)}
+        unk = w2i.get("<unk>", 1)
+        for line in open(args.dec_text_scp, encoding="utf-8"):
+            p = line.rstrip("\n").split(" ", 1)
+            dec_map[p[0]] = [w2i.get(w, unk) for w in p[1].split()] if len(p) > 1 else []
+        print(f"dec_text 読込: {len(dec_map)} 件", flush=True)
     past_map = {}
     if args.past_speech_scp:
         for line in open(args.past_speech_scp, encoding="utf-8"):
@@ -192,7 +337,34 @@ def eval_xfmr_pool(model, wav_scp, tags, args):
     if args.max_utts > 0:
         utts = utts[: args.max_utts]
     preds, labels = [], []
-    n_done = n_skip = 0
+    n_done = n_skip = n_clip = 0
+    # 早期確定：現発話を「発話末の trunc_sec 秒手前」で打ち切って渡す。head の読み出しは
+    # 常に渡された音声の最終フレームなので、これがその時点での判定になる。
+    # 短い発話は打ち切ると消えてしまうので MIN_KEEP で下限を設け、評価区間数を t によらず
+    # 一定に保つ（下限に当たった件数は n_clip として報告する）。
+    trunc = int(getattr(args, "trunc_sec", 0.0) * 16000)
+    # 前向きグリッド：発話「開始から」keep_sec 秒だけ渡す。trunc_sec が発話末を基準に
+    # 切るのに対し、こちらは経過時間を基準に切るので、実行時に観測できる状態と一致する。
+    # 発話がそれより短ければ全体を渡す（その時刻には発話が既に終わっているため）。
+    keep_fw = int(getattr(args, "keep_sec", 0.0) * 16000)
+    MIN_KEEP = 4000                                    # 0.25 秒
+    # 元録音からの切り出し：セグメント終端を越えて音声を伸ばす。
+    # 発話が終わったあとの無音（や次の発話）が入るので、実運用のストリーミングに一致する。
+    full_map, seg_map = {}, {}
+    if getattr(args, "full_wav_scp", "") and getattr(args, "segments", ""):
+        for line in open(args.full_wav_scp):
+            q = line.split(maxsplit=1)
+            if len(q) == 2: full_map[q[0]] = q[1].strip()
+        for line in open(args.segments):
+            q = line.split()
+            if len(q) == 4: seg_map[q[0]] = (q[1], float(q[2]), float(q[3]))
+        print(f"元録音から切り出す: 録音 {len(full_map)} / セグメント {len(seg_map)}", flush=True)
+    dump_f = open(args.dump_preds, "w", encoding="utf-8") if args.dump_preds else None
+    horizons = list(getattr(model, "tt_horizons", []) or [])
+    if dump_f:
+        # 先読みヘッドの列は末尾に足す（既存の読み込み側は先頭 7 列しか見ないので互換）
+        hcols = "".join(f"\tp_h{h:g}" for h in horizons)
+        dump_f.write("utt\ttrue\tpred\tp_cont\tp_end\tp_bc\tn_samp" + hcols + "\n")
     for u in utts:
         p = wav_scp[u]
         if "|" in p:
@@ -202,6 +374,24 @@ def eval_xfmr_pool(model, wav_scp, tags, args):
         except Exception:
             n_skip += 1; continue
         if wav.ndim > 1: wav = wav[:, 0]
+        if keep_fw > 0 and u in seg_map and seg_map[u][0] in full_map:
+            rec, b, e = seg_map[u]
+            try:                                       # 元録音から [開始, 開始+keep] を読む
+                wav = sf.read(full_map[rec], dtype="float32",
+                              start=int(b * 16000), frames=keep_fw, always_2d=False)[0]
+                if wav.ndim > 1: wav = wav[:, 0]
+                if keep_fw > int((e - b) * 16000): n_clip += 1   # 発話後の無音を含む
+            except Exception:
+                n_skip += 1; continue
+        elif keep_fw > 0:
+            if keep_fw >= len(wav):
+                n_clip += 1                            # その時刻には発話が終わっている
+            wav = wav[:min(keep_fw, len(wav))]
+        elif trunc > 0:
+            keep = len(wav) - trunc
+            if keep < MIN_KEEP:
+                keep = min(MIN_KEEP, len(wav)); n_clip += 1
+            wav = wav[:keep]
         if len(wav) < 320:
             n_skip += 1; continue
         past_wav = None
@@ -222,12 +412,26 @@ def eval_xfmr_pool(model, wav_scp, tags, args):
                 if len(cat) >= 320:
                     past_wav = cat
                     past_bounds = [len(a) for a in arrs]   # 発話境界（連結順）
-        preds.append(predict_utt_xfmr_pool(model, wav, past_wav, args.device,
-                                           past_bounds))
+        di = dec_map.get(u)
+        if dump_f:
+            pr, prob, ph = predict_utt_xfmr_pool(model, wav, past_wav, args.device,
+                                                 past_bounds, return_prob=True, dec_ids=di)
+            dump_f.write(f"{u}\t{tags[u]}\t{pr}\t{prob[0]:.6f}\t{prob[1]:.6f}"
+                         f"\t{prob[2]:.6f}\t{len(wav)}"
+                         + "".join(f"\t{x:.6f}" for x in ph) + "\n")
+        else:
+            pr = predict_utt_xfmr_pool(model, wav, past_wav, args.device, past_bounds,
+                                       dec_ids=di)
+        preds.append(pr)
         labels.append(tags[u]); n_done += 1
         if n_done % 2000 == 0:
             print(f"  ...{n_done} 区間", flush=True)
-    print(f"処理: {n_done} (skip={n_skip})")
+    if dump_f:
+        dump_f.close()
+        print(f"予測ダンプ: {args.dump_preds}")
+    print(f"処理: {n_done} (skip={n_skip}"
+          + (f", 打ち切り下限に到達={n_clip}" if trunc > 0 else "")
+          + (f", 発話が既に終了={n_clip}" if keep_fw > 0 else "") + ")")
     report(preds, labels)
 
 
@@ -414,13 +618,31 @@ def main():
     ap.add_argument("--n_past", type=int, default=2)
     ap.add_argument("--max_past_sec", type=float, default=30.0)
     ap.add_argument("--max_utts", type=int, default=0)
+    ap.add_argument("--dec_text_scp", default="",
+                    help="tt_use_dec: デコーダに渡すトークン列。ASR仮説 text=実運用条件 / "
+                         "data/<set>/text=理想カスケード相当の上限")
+    ap.add_argument("--trunc_sec", type=float, default=0.0,
+                    help="早期確定: 現発話を発話末の t 秒手前で打ち切って評価する（過去発話は不変）")
+    ap.add_argument("--full_wav_scp", default="",
+                    help="元録音の wav.scp（チャネル単位）。--segments と併せて keep_sec に使うと、"
+                         "セグメント終端を越えて音声を伸ばせる（発話後の無音を含む実運用条件）")
+    ap.add_argument("--segments", default="",
+                    help="--full_wav_scp と対で使う segments ファイル")
+    ap.add_argument("--keep_sec", type=float, default=0.0,
+                    help="前向きグリッド: 発話開始から t 秒だけ渡して評価する"
+                         "（経過時間ベース＝実行時に観測できる状態。trunc_sec と排他）")
+    ap.add_argument("--frame_level", action="store_true",
+                    help="1 回の符号化で全フレーム位置の判定を出す（--full_wav_scp/--segments 必須）")
+    ap.add_argument("--frame_max_sec", type=float, default=3.0,
+                    help="frame_level: 発話開始から何秒ぶんを符号化するか")
     ap.add_argument("--dump_preds", default="",
                     help="xfmr: 区間ごとの正解/予測/確率を TSV に出す（誤り分析用）")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
     from espnet2.tasks.asr import TurnTakingASRTask
-    model, _ = TurnTakingASRTask.build_model_from_file(args.config, args.model, args.device)
+    model, train_args = TurnTakingASRTask.build_model_from_file(
+        args.config, args.model, args.device)
     model.eval()
 
     data_dir = Path(args.data_dir)
@@ -428,12 +650,17 @@ def main():
     tags = {k: int(v) for k, v in read_map(data_dir / "tag").items()}
     seg_path = data_dir / "segments"
 
+    if args.frame_level:
+        eval_frame_level(model, wav_scp, tags, args)
+        return
+
     if args.past_text:
         eval_xfmr_text(model, wav_scp, tags, args)
         return
 
     if args.past_pool:
-        eval_xfmr_pool(model, wav_scp, tags, args)
+        eval_xfmr_pool(model, wav_scp, tags, args,
+                       getattr(train_args, "token_list", None))
         return
 
     if args.xfmr:
