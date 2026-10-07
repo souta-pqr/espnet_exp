@@ -30,3 +30,13 @@ __pycache__/
 *.bak
 *.broken
 *.orig
+
+# 実験で実際に使った（手で直した）config は残す
+!egs2/cejc/asr1/myconf/.gen_pool_attn-frame2-blk42_same_n5_p30.yaml
+!egs2/cejc/asr1/myconf/.gen_pool_attn-frame2-blk42ep40_same_n5_p30.yaml
+!egs2/cejc/asr1/myconf/.gen_pool_attn-frame2-blk42xh2-g_same_n5_p30.yaml
+!egs2/cejc/asr1/myconf/.gen_pool_attn-frame2-blk42xh2_same_n5_p30.yaml
+!egs2/cejc/asr1/myconf/.gen_pool_attn-frame2-blk42xh2ep40_same_n5_p30.yaml
+!egs2/cejc/asr1/myconf/.gen_pool_attn-frame2-blk60_same_n5_p30.yaml
+!egs2/cejc/asr1/myconf/.gen_pool_attn-frame2-blk60xh2_same_n5_p30.yaml
+!egs2/cejc/asr1/myconf/.gen_pool_attn-frame2_same_n5_p30.yaml
