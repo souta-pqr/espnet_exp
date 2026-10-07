@@ -182,6 +182,12 @@ use_cif_detection=false          # CIF タグ検出を有効にする (use_disfl
 # use_disfluency_detection=false と併用すること (disfluency 系のデータ・引数を切るため)。
 use_turntaking_detection=false
 
+# 過去文脈・無音込み・BERT 表現などの追加入力 (past_speech / past_bounds / past_text /
+# tail_speech / text_vec) を学習に渡すかどうか。dump に .scp があれば既定で渡す。
+# これらを使わないモデル (turntaking_weight=0 の純粋 ASR など) では flac 読み込みが
+# 律速するだけなので false にする。学習の中身は変わらない。
+use_context_inputs=true
+
 help_message=$(cat << EOF
 Usage: $0 --train-set "<train_set_name>" --valid-set "<valid_set_name>" --test_sets "<test_set_names>"
 
@@ -1431,21 +1437,33 @@ if [ ${stage} -le 10 ] && [ ${stop_stage} -ge 10 ] && ! [[ " ${skip_stages} " =~
 
     # 過去音声は複数flacを時間連結して読む concat_sound 型（soundfileのみ・subprocess不使用
     # ＝DataLoader fork worker でデッドロックしない。旧 pipe_sound(sox) はハングするため廃止）
-    if [ -f "${_asr_train_dir}/past_speech.scp" ] && [ -f "${_asr_valid_dir}/past_speech.scp" ]; then
+    if ${use_context_inputs} && [ -f "${_asr_train_dir}/past_speech.scp" ] && [ -f "${_asr_valid_dir}/past_speech.scp" ]; then
         _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/past_speech.scp,past_speech,concat_sound "
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/past_speech.scp,past_speech,concat_sound "
     fi
 
     # 連結で失われる発話境界（各過去発話のサンプル数）。発話単位の圧縮 (tt_past_pool=utt) 用
-    if [ -f "${_asr_train_dir}/past_bounds.scp" ] && [ -f "${_asr_valid_dir}/past_bounds.scp" ]; then
+    if ${use_context_inputs} && [ -f "${_asr_train_dir}/past_bounds.scp" ] && [ -f "${_asr_valid_dir}/past_bounds.scp" ]; then
         _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/past_bounds.scp,past_bounds,text_int "
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/past_bounds.scp,past_bounds,text_int "
     fi
 
     # 過去発話をテキストで入れる版（トークンID列を text_int で読む）
-    if [ -f "${_asr_train_dir}/past_text.scp" ] && [ -f "${_asr_valid_dir}/past_text.scp" ]; then
+    if ${use_context_inputs} && [ -f "${_asr_train_dir}/past_text.scp" ] && [ -f "${_asr_valid_dir}/past_text.scp" ]; then
         _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/past_text.scp,past_text,text_int "
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/past_text.scp,past_text,text_int "
+    fi
+
+    # 無音込み学習：発話後の音声（元録音の [end, end+α]）。tt_tail_sec>0 のモデルだけが使う
+    if ${use_context_inputs} && [ -f "${_asr_train_dir}/tail_speech.scp" ] && [ -f "${_asr_valid_dir}/tail_speech.scp" ]; then
+        _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/tail_speech.scp,tail_speech,sound "
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/tail_speech.scp,tail_speech,sound "
+    fi
+
+    # 認識結果テキストの BERT 表現（共同学習用）
+    if ${use_context_inputs} && [ -f "${_asr_train_dir}/text_vec.scp" ] && [ -f "${_asr_valid_dir}/text_vec.scp" ]; then
+        _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/text_vec.scp,text_vec,kaldi_ark "
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/text_vec.scp,text_vec,kaldi_ark "
     fi
 
     if ${use_prompt}; then
@@ -1678,14 +1696,20 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
         if [ -f "${_asr_train_dir}/past_vec.scp" ]; then
             _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/past_vec.scp,past_vec,kaldi_ark "
         fi
-        if [ -f "${_asr_train_dir}/past_speech.scp" ]; then
+        if ${use_context_inputs} && [ -f "${_asr_train_dir}/past_speech.scp" ]; then
             _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/past_speech.scp,past_speech,concat_sound "
         fi
-        if [ -f "${_asr_train_dir}/past_bounds.scp" ]; then
+        if ${use_context_inputs} && [ -f "${_asr_train_dir}/past_bounds.scp" ]; then
             _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/past_bounds.scp,past_bounds,text_int "
         fi
-        if [ -f "${_asr_train_dir}/past_text.scp" ]; then
+        if ${use_context_inputs} && [ -f "${_asr_train_dir}/past_text.scp" ]; then
             _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/past_text.scp,past_text,text_int "
+        fi
+        if ${use_context_inputs} && [ -f "${_asr_train_dir}/tail_speech.scp" ]; then
+            _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/tail_speech.scp,tail_speech,sound "
+        fi
+        if ${use_context_inputs} && [ -f "${_asr_train_dir}/text_vec.scp" ]; then
+            _opts+="--train_data_path_and_name_and_type ${_asr_train_dir}/text_vec.scp,text_vec,kaldi_ark "
         fi
     fi
 
@@ -1722,14 +1746,20 @@ if [ ${stage} -le 11 ] && [ ${stop_stage} -ge 11 ] && ! [[ " ${skip_stages} " =~
     if [ -f "${_asr_valid_dir}/past_vec.scp" ]; then
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/past_vec.scp,past_vec,kaldi_ark "
     fi
-    if [ -f "${_asr_valid_dir}/past_speech.scp" ]; then
+    if ${use_context_inputs} && [ -f "${_asr_valid_dir}/past_speech.scp" ]; then
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/past_speech.scp,past_speech,concat_sound "
     fi
-    if [ -f "${_asr_valid_dir}/past_bounds.scp" ]; then
+    if ${use_context_inputs} && [ -f "${_asr_valid_dir}/past_bounds.scp" ]; then
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/past_bounds.scp,past_bounds,text_int "
     fi
-    if [ -f "${_asr_valid_dir}/past_text.scp" ]; then
+    if ${use_context_inputs} && [ -f "${_asr_valid_dir}/past_text.scp" ]; then
         _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/past_text.scp,past_text,text_int "
+    fi
+    if ${use_context_inputs} && [ -f "${_asr_valid_dir}/tail_speech.scp" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/tail_speech.scp,tail_speech,sound "
+    fi
+    if ${use_context_inputs} && [ -f "${_asr_valid_dir}/text_vec.scp" ]; then
+        _opts+="--valid_data_path_and_name_and_type ${_asr_valid_dir}/text_vec.scp,text_vec,kaldi_ark "
     fi
 
     if ${use_prompt}; then
