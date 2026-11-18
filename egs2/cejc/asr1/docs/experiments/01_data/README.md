@@ -58,14 +58,23 @@ cp dump/raw/<set>/past_speech_same_n5_p30.scp dump/raw/<set>/past_speech.scp
 cp dump/raw/<set>/past_speech_same_n5_p30_bounds.scp dump/raw/<set>/past_bounds.scp
 ```
 
-### 4. 提案手法の学習データ `train_gxac`
+### 4. 前の区間とつないだ音声 `train_gxm`
+
+```bash
+python local/make_gxm.py        # → dump/raw/train_gxm と統計 exp/asr_stats_..._tail_gxm
+```
+
+- 継続の区間の後に，同じ話者の区間が 0.4〜3 秒の間で続く組（58,617 組）ごとに，「前の区間 間 今の区間」を 1 つの学習例として足す．ラベルと区間末の後の音声は今の区間のもの．
+- ディスクに書くのは間の音声だけ（約 1 GB）．読むときに `concat_sound`（`asr_gxm.sh` の `SPEECH_TYPE`）で 3 つをつなぐ．
+
+### 5. 提案手法の学習データ `train_gxac`
 
 ```bash
 python local/encac/make_train_gxac.py
 ```
 
 - `train_gx` の全区間に，`dump/raw/train_gxm` のつないだ区間（ID が `m` で終わるもの，58,617 区間）を足す．計 375,612 区間．
-- `train_gxm` は silver12 の `make_gxm.py` で作った．このスクリプトはまだリポジトリに入っていない．
+- 先に 4 の `train_gxm` を作っておく．
 
 ## 注意
 

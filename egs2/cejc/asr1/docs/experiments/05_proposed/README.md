@@ -16,7 +16,7 @@
 ### 0. 準備
 
 - [03 音声認識](../03_stage1_asr/README.md) の重み：`exp/asr_20261006-pureasr-g-blk42-sp/valid.loss.ave.pth`
-- 学習データ `data/train_gxac`：[01 データの準備](../01_data/README.md) の 4
+- 学習データ `data/train_gxac`：[01 データの準備](../01_data/README.md) の 5
 - 開発データ `data/dev_g`（4,000 区間で検証し，損失が最小の重みを残す）
 
 ### 1. 学習（GPU 1 枚，メモリ最大約 27 GB）

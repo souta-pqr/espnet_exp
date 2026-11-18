@@ -71,5 +71,5 @@ gm・gt から 1 か所だけ変えて学習する．名前を引数に渡す．
 
 ## 注意
 
-- `train_gxm` を作る `make_gxm.py` は silver12 にあり，まだリポジトリに入っていない．
+- `train_gxm` は [01 データの準備](../01_data/README.md) の 4（`local/make_gxm.py`）で作る．
 - 種だけ変えた版（gts31 など），音声認識の損失を足した版（`espnet_asrw`）は採らなかったので入れていない．
