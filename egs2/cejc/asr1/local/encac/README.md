@@ -1,5 +1,7 @@
 # encac：音響だけの判定器（提案手法）と Easy Turn の検証
 
+手順は [05 提案手法](../../docs/experiments/05_proposed/README.md) と [06 比べる相手](../../docs/experiments/06_baselines/README.md)．
+
 silver13 の `~/2026/work/easy_turn/cejc/` で使ったもの（2026-11）．
 
 ## 提案手法の学習
@@ -16,3 +18,7 @@ silver13 の `~/2026/work/easy_turn/cejc/` で使ったもの（2026-11）．
 - `train_et.py`：CEJC での fine-tuning．`--no_text` で書き起こしを出さない版．
 - `ac_model.py`・`run_et_ac.sh`：音響だけ（エンコーダ＋平均＋線形層）のアブレーション．
 - `et_dump.py`：スコアの書き出し．`et_speed.py`・`try_et.py`：動作と速さの確認．
+
+## データ
+
+- `make_train_gxac.py`：提案手法の学習データ `data/train_gxac` を作る．

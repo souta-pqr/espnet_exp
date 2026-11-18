@@ -1,5 +1,7 @@
 # 発話区間末ラベルの付与（Qwen3-8B oneshot）
 
+今のラベル（gemma-4-31B）の付け方は [02 ラベル](../../docs/experiments/02_labels/README.md)．このページは最初の Qwen3-8B の手順．
+
 学習・評価のラベル（`data/*_g/tag`。0=継続 / 1=完了 / 2=相槌）を作った手順。
 元は `~/work/cejc-label/`（2026-10-05 にユーザが配置）。ここにはその写しを置く。
 

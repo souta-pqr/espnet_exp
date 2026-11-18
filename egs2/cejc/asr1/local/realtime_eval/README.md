@@ -1,5 +1,7 @@
 # realtime_eval：実時間の評価
 
+手順は [07 実時間の評価](../../docs/experiments/07_realtime_eval/README.md) と [08 別の対話データ](../../docs/experiments/08_other_corpora/README.md)．
+
 silver13 の `~/2026/work/rt_eval_20261102/` で使ったもの（2026-11）．録音全体を頭から 32 ms ずつ，デモと同じ実時間のプログラム（`epd.engine`，別リポジトリ exp-realtime-epd）に流して採点する．
 
 ## 主なもの
@@ -19,3 +21,8 @@ silver13 の `~/2026/work/rt_eval_20261102/` で使ったもの（2026-11）．�
 - `rt_hazumi*.py`：Hazumi での採点．
 
 データ（CEJC・waseda_soma・Hazumi の音声と書き起こし）と重みは含まない．
+
+## データの準備
+
+- `soma_prep.py`・`soma_cejc_tag.py`：waseda_soma を CEJC と同じ形にする．
+- `hazumi_extract.py`：Hazumi の動画からユーザの音声を取り出す．
