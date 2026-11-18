@@ -91,9 +91,15 @@ fi
 # ---- 3. デコード（dev_g・eval_g は CER、train_g は BERT の学習用）----
 if ! done_ decode; then
   log "デコード（dev_g eval_g train_g）"
+  # asr.sh は test_sets に train_set と同じ名前を許さないので，train_g は別名 train_g_dec（ディレクトリへのリンク）でデコードし，
+  # 結果を train_g として参照できるようにリンクを張る（旧分割の train_nodup_dec と同じやり方）
+  [ -e dump/raw/train_g_dec ] || ln -s train_g dump/raw/train_g_dec
   ./asr.sh --stage 12 --stop_stage 13 "${common[@]}" --asr_config "$CFG" --asr_tag "$TAG" \
-      --test_sets "dev_g eval_g train_g" || { echo "デコード失敗"; exit 1; }
+      --test_sets "dev_g eval_g train_g_dec" || { echo "デコード失敗"; exit 1; }
   DEC=exp/asr_$TAG/decode_cbs_transducer_bounded_asr_model_valid.loss.ave
+  [ -e "$DEC/train_g" ] || ln -s train_g_dec "$DEC/train_g"
+  # dev_g は valid_set なので asr.sh は $DEC/org/dev_g に出力する。後段が $DEC/dev_g で読めるようにリンクを張る
+  [ -e "$DEC/dev_g" ] || ln -s org/dev_g "$DEC/dev_g"
   for ds in dev_g eval_g train_g; do [ -s "$DEC/$ds/text" ] || { echo "デコード出力なし $ds"; exit 1; }; done
   grep -A6 -E "^### (CER|WER)" "exp/asr_$TAG/RESULTS.md" | grep -E "###|_g\|"
   mark decode
