@@ -54,9 +54,11 @@ for ds in dev_g eval_g train_g; do [ -s "$DEC/$ds/text" ] || { echo "認識結�
 # 票は全件（LLM が判定する 137,812 件。silver9 の README で確認）がそろうまで待つ。
 # README は実行中から自動で書かれるので、完了の合図には使わない（LINE の重複を除いた件数で判断する）。
 NEED=137812
-nlines() { [ -f "$1" ] && cut -f1 "$1" | sort -u | wc -l || echo 0; }
+# 32B は silver9（前から）と silver13（後ろから，別ファイル）で分担しているので，両方を合わせて数える
+V32="$VOTE/Qwen3-32B-AWQ-nothink.tsv,$VOTE/Qwen3-32B-AWQ-nothink.silver13.tsv"
+nlines() { local n=0; n=$(for f in ${1//,/ }; do [ -f "$f" ] && cut -f1 "$f"; done | sort -u | wc -l); echo "$n"; }
 while :; do
-  a=$(nlines "$VOTE/Qwen3-32B-AWQ-nothink.tsv"); b=$(nlines "$VOTE/Qwen3-8B-think.tsv")
+  a=$(nlines "$V32"); b=$(nlines "$VOTE/Qwen3-8B-think.tsv")
   [ "$a" -ge "$NEED" ] && [ "$b" -ge "$NEED" ] && break
   echo "[$(date '+%m-%d %H:%M')] 票の待機中: 32B $a / 8B 思考あり $b（必要 $NEED）"
   sleep 1800
@@ -67,7 +69,7 @@ log "多数決の票がそろったのを確認"
 # ---- 1. 多数決でラベルを作り直す → クラス重み ----
 if ! done_ vote; then
   log "多数決でラベルを作り直す"
-  $PY local/turntaking/vote_tags.py --v32b "$VOTE/Qwen3-32B-AWQ-nothink.tsv" \
+  $PY local/turntaking/vote_tags.py --v32b "$V32" \
       --v8think "$VOTE/Qwen3-8B-think.tsv" --write || { echo "多数決に失敗"; exit 1; }
   # dump 側の tag も揃える（dev_g / eval_g は長さで絞っていないので行がそのまま対応する）
   for ds in dev_g eval_g; do

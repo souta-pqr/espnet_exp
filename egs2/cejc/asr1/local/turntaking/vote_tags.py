@@ -23,6 +23,9 @@ SETS = ("train_g", "train_g_extra", "dev_g", "eval_g")   # train_g_extra は漏�
 
 def read_votes(path):
     v = {}
+    if not Path(path).exists():
+        print(f"（まだ無いので飛ばす: {path}）")
+        return v
     for l in open(path, encoding="utf-8"):
         p = l.rstrip("\n").split("\t")
         if len(p) >= 2 and p[0].isdigit() and p[1] in ("はい", "いいえ"):
@@ -37,7 +40,12 @@ def main():
     ap.add_argument("--write", action="store_true")
     args = ap.parse_args()
 
-    a = read_votes(args.v32b); b = read_votes(args.v8think)
+    # カンマ区切りで複数のファイルを渡せる（32B を silver9 と silver13 で分担したため）
+    a = {}; b = {}
+    for f in args.v32b.split(","):
+        a.update(read_votes(f))
+    for f in args.v8think.split(","):
+        b.update(read_votes(f))
     line2utt = {}; qwen = {}
     for l in list(open(MAP))[1:]:
         ln, u, r = l.rstrip("\n").split("\t")
