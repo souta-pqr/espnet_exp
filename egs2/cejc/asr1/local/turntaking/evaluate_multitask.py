@@ -9,7 +9,6 @@ macro-F1・no/yes 二値分離を出す。早期確定（SPRT/TEASER）は使わ
 --ctx_scp で ctx_vec.scp を渡す。
 """
 import argparse
-import math
 from collections import defaultdict
 from pathlib import Path
 
@@ -101,19 +100,16 @@ def predict_utt_xfmr_pool(model, wav, past_wav, device, past_bounds=None,
     # （以前は 0.25s 未満を「過去なし」に落としていて train/eval が食い違っていた）
     # encode() は渡した長さで波形を切るため、長さに真値を渡すとパディングが消えてしまう。
     # 学習時と同じ「パディングごと符号化し、有効フレーム数だけを使う」形にする。
-    MIN_PAST = 16000        # 1 s（block_size 18 フレーム ≒ 0.6 s を確実に上回る長さ）
+    # 2026-10-16：以前は 1 秒までゼロ詰めしていたが，学習側（_encode_past）は幅 3 秒未満のとき 3 秒の無音を
+    # 1 本足して符号化する．幅 1.7 秒未満では処理経路が変わり，過去 3 秒未満で過去表現が食い違っていた
+    # （過去なしで cos 0.74）．学習側の関数をそのまま呼ぶ．
     po = None
     if past_wav is not None and len(past_wav) > 0:
         n = len(past_wav)
-        pw = past_wav if n >= MIN_PAST else np.pad(past_wav, (0, MIN_PAST - n))
         try:
-            px = torch.from_numpy(pw.astype(np.float32)).unsqueeze(0).to(device)
-            penc = model.encode(px, torch.tensor([len(pw)], device=device))
-            po = penc[0][0] if isinstance(penc[0], tuple) else penc[0]
-            # 有効フレーム数 = 真の長さ相当（ゼロ詰め部分は捨てる）
-            fps = penc[1].item() / float(len(pw))            # フレーム/サンプル
-            nf = max(1, min(int(math.ceil(n * fps)), po.shape[1]))
-            pl_frames = torch.tensor([nf], dtype=torch.long, device=po.device)
+            px = torch.from_numpy(past_wav.astype(np.float32)).unsqueeze(0).to(device)
+            po, pl_frames = model._encode_past(px, torch.tensor([n], device=device))
+            pl_frames = pl_frames.to(po.device)
         except Exception:
             po = None
     if po is None:
@@ -204,7 +200,7 @@ def eval_frame_level(model, wav_scp, tags, args):
     utts = [u for u in wav_scp if u in tags and u in seg_map]
     if args.max_utts > 0:
         utts = utts[: args.max_utts]
-    keep = int(args.frame_max_sec * 16000)
+    post = args.frame_post_sec            # > 0 なら区間ごとに「区間の長さ + post 秒」を読む
 
     f = open(args.dump_preds, "w", encoding="utf-8")
     f.write("utt\ttrue\tpos\telapsed\tp_cont\tp_end\tp_bc\n")
@@ -213,9 +209,10 @@ def eval_frame_level(model, wav_scp, tags, args):
         rec, b, e = seg_map[u]
         if rec not in full_map:
             n_skip += 1; continue
-        try:                      # 発話開始から frame_max_sec 秒ぶんを元録音から読む
+        max_sec = (e - b + post) if post > 0 else args.frame_max_sec
+        try:                      # 発話開始から max_sec 秒ぶんを元録音から読む
             wav = sf.read(full_map[rec], dtype="float32",
-                          start=int(b * 16000), frames=keep, always_2d=False)[0]
+                          start=int(b * 16000), frames=int(max_sec * 16000), always_2d=False)[0]
         except Exception:
             n_skip += 1; continue
         if wav.ndim > 1:
@@ -232,7 +229,7 @@ def eval_frame_level(model, wav_scp, tags, args):
         pv = eo.new_zeros(1, 0, D)
         pl = torch.zeros(1, dtype=torch.long, device=eo.device)
         paths = past_map.get(u)
-        if paths:
+        if paths and model.tt_past_pool in ("max", "attn"):   # 過去の文脈なし（none．abnp）は学習と同じく長さ 0
             arrs = []
             for pp in paths:
                 try:
@@ -243,14 +240,10 @@ def eval_frame_level(model, wav_scp, tags, args):
                     pass
             cat = np.concatenate(arrs) if len(arrs) > 1 else (arrs[0] if arrs else None)
             if cat is not None and len(cat) >= 320:
-                MIN_PAST = 16000
-                pw = cat if len(cat) >= MIN_PAST else np.pad(cat, (0, MIN_PAST - len(cat)))
-                px = torch.from_numpy(pw.astype(np.float32)).unsqueeze(0).to(args.device)
-                penc = model.encode(px, torch.tensor([len(pw)], device=args.device))
-                po = penc[0][0] if isinstance(penc[0], tuple) else penc[0]
-                fps = penc[1].item() / float(len(pw))
-                nf = max(1, min(int(math.ceil(len(cat) * fps)), po.shape[1]))
-                plf = torch.tensor([nf], dtype=torch.long, device=po.device)
+                # 学習側と同じ符号化（2026-10-16 修正．以前は 1 秒までゼロ詰め）
+                px = torch.from_numpy(cat.astype(np.float32)).unsqueeze(0).to(args.device)
+                po, plf = model._encode_past(px, torch.tensor([len(cat)], device=args.device))
+                plf = plf.to(po.device)
                 if model.tt_past_pool == "max":
                     msk = torch.arange(po.shape[1], device=po.device)[None, :] >= plf[:, None]
                     pooled = po.masked_fill(msk.unsqueeze(-1), float("-inf")).max(dim=1).values
@@ -268,7 +261,7 @@ def eval_frame_level(model, wav_scp, tags, args):
         prob = out.softmax(-1).cpu().numpy()
         for i in range(F):
             el = (i + 1) * sec_per_frame
-            if el > args.frame_max_sec + 1e-6:
+            if el > max_sec + 1e-6:
                 break
             f.write(f"{u}\t{tags[u]}\t{i}\t{el:.4f}"
                     f"\t{prob[i,0]:.6f}\t{prob[i,1]:.6f}\t{prob[i,2]:.6f}\n")
@@ -635,6 +628,8 @@ def main():
                     help="1 回の符号化で全フレーム位置の判定を出す（--full_wav_scp/--segments 必須）")
     ap.add_argument("--frame_max_sec", type=float, default=3.0,
                     help="frame_level: 発話開始から何秒ぶんを符号化するか")
+    ap.add_argument("--frame_post_sec", type=float, default=0.0,
+                    help="frame_level: > 0 なら frame_max_sec の代わりに「区間の長さ + この秒数」を符号化する")
     ap.add_argument("--dump_preds", default="",
                     help="xfmr: 区間ごとの正解/予測/確率を TSV に出す（誤り分析用）")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
