@@ -529,6 +529,9 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
         # 読み出し位置を引く窓。発話末の tt_frame_win_sec 秒手前から、
         # 発話末＋tt_tail_sec 秒後まで（tail_speech がある場合）。
         tt_frame_win_sec: float = 0.6,
+        # False で読み出しを発話末までに限る（入力には tail を足したまま）。
+        # 区間末の後の位置で学習しないアブレーション用（2026-10-26）。
+        tt_tail_readout: bool = True,
         tt_horizon_weight: float = 1.0,      # 先読み BCE の重み λ
         tt_horizon_pos_weight: float = 1.0,  # 正例（h 秒以内に完了）の重み
         # 過去発話の要約方法。"none"=事前計算 past_vec を使う（既定・従来）／
@@ -602,6 +605,7 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
                          f"({tt_text_dim} → {encoder.output_size()})、発話末以降のみ有効")
         self.tt_frame_readouts = int(tt_frame_readouts)
         self.tt_frame_win_sec = float(tt_frame_win_sec)
+        self.tt_tail_readout = bool(tt_tail_readout)
         if self.tt_frame_readouts > 0:
             logging.info(
                 f"[turntaking_xfmr] フレーム単位学習: 読み出し {self.tt_frame_readouts} 点 / "
@@ -743,6 +747,10 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
         if self.tt_adapt == "none":
             # 完全凍結：エンコーダも eval（BN 統計も止め、ASR をビット単位で不変にする）
             self.encoder.eval()
+        elif self.tt_adapt == "full":
+            # 全体学習（ASR の事前学習なしのアブレーション，2026-10-26）：エンコーダも一から学習するので BN 統計も更新する。
+            # init_param と freeze_param: encoder を外して使う。
+            pass
         else:
             # 部分適応：LoRA/Adapter に勾配を流すためエンコーダは train のまま。
             # ただし BatchNorm の running 統計だけは更新させない（適応対象を PEFT に限定）。
@@ -779,6 +787,19 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
         encode() は self.training を見て SpecAug を掛ける。過去は「記憶」なので、
         tt_past_specaug=False のときだけ一時的に外して符号化する。
         """
+        # バッチ全員の過去が短い（例：全員「過去なし」＝20 ms 無音）と，encode() がバッチ内の最長に切り詰めるため
+        # 畳み込みのサブサンプリングで落ちる（2026-10-10，train_gx で発生）。そのときだけ長さ 3 秒の無音を 1 本足して
+        # 符号化し，出力から取り除く。エンコーダは凍結（eval）で各発話を独立に処理するので，残りの発話の扱いは
+        # 長い過去を持つ発話と同じバッチに入ったときと同じ（幅がブロック 42 フレーム≒1.7 秒より短いと処理経路が変わり
+        # 出力も変わるため，3 秒にする。幅 2 秒以上なら出力は幅によらず一致することを確認済み）。
+        MIN_PAST = 48000
+        dummy = int(past_speech_lengths.max()) < MIN_PAST
+        if dummy:
+            if past_speech.shape[1] < MIN_PAST:
+                past_speech = torch.nn.functional.pad(past_speech, (0, MIN_PAST - past_speech.shape[1]))
+            past_speech = torch.cat([past_speech, past_speech.new_zeros(1, past_speech.shape[1])], 0)
+            past_speech_lengths = torch.cat(
+                [past_speech_lengths, past_speech_lengths.new_full((1,), MIN_PAST)], 0)
         sa = self.specaug
         if not self.tt_past_specaug:
             self.specaug = None
@@ -788,13 +809,16 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
                     p_out, p_lens = self.encode(past_speech, past_speech_lengths)
                     if isinstance(p_out, tuple):
                         p_out = p_out[0]
-                    return p_out.detach(), p_lens
-            p_out, p_lens = self.encode(past_speech, past_speech_lengths)
-            if isinstance(p_out, tuple):
-                p_out = p_out[0]
-            return p_out, p_lens
+                    p_out = p_out.detach()
+            else:
+                p_out, p_lens = self.encode(past_speech, past_speech_lengths)
+                if isinstance(p_out, tuple):
+                    p_out = p_out[0]
         finally:
             self.specaug = sa
+        if dummy:
+            p_out, p_lens = p_out[:-1], p_lens[:-1]
+        return p_out, p_lens
 
     def _decoder_states(self, text, text_lengths, dtype):
         """Transducer デコーダを凍結のまま通し、状態列を head の次元へ射影する。
@@ -982,7 +1006,7 @@ class TurnTakingXfmrASRModel(ESPnetASRModel):
                 min=1, max=int(enc_lens.max()))
             lo = (end_f - int(round(self.tt_frame_win_sec * 16000
                                     * float(fps.mean())))).clamp(min=1)
-            hi = enc_lens.clamp(min=1)
+            hi = enc_lens.clamp(min=1) if self.tt_tail_readout else end_f
             K = self.tt_frame_readouts
             if self.training:
                 r = torch.rand(K - 1, batch_size, device=enc_out.device)
