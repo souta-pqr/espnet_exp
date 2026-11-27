@@ -20,6 +20,7 @@ ap.add_argument("--bs", type=int, default=16)
 ap.add_argument("--acc", type=int, default=4)
 ap.add_argument("--freeze_enc", action="store_true", help="エンコーダを固めて線形層だけ学習する（BatchNorm の統計も固める．11/05）")
 ap.add_argument("--ctc_only", action="store_true", help="3 クラスの損失を使わず，補助タスク（CTC）だけでエンコーダを学習する．CER の公平な基準（11/27）．検証の損失（3 クラス）は意味を持たないので，最後の重みを残す")
+ap.add_argument("--ckpt_every", type=int, default=500, help="この更新回数ごとに <出力>/last.pt（重み・optimizer・学習率・進み具合）を残す．<出力>/last.pt があれば，そこから再開する（11/27）")
 ap.add_argument("--warmup", type=int, default=1000)
 ap.add_argument("--nval", type=int, default=4000)
 ap.add_argument("--workers", type=int, default=6)
@@ -95,18 +96,40 @@ def validate(dl):
 tr = load(args.train)
 va = load("dev_g")
 va = [va[i] for i in np.random.default_rng(0).permutation(len(va))[:args.nval]]
-dl = torch.utils.data.DataLoader(DS(tr, False), batch_size=args.bs, shuffle=True, num_workers=args.workers,
+class EpochSampler(torch.utils.data.Sampler):
+    """エポックごとに決まった並び（乱数の種＝エポック）．途中から再開するとき，済んだ分を飛ばす（11/27）"""
+    def __init__(self, n):
+        self.n, self.ep, self.start = n, 1, 0
+    def __iter__(self):
+        return iter(np.random.default_rng(self.ep).permutation(self.n)[self.start:].tolist())
+    def __len__(self):
+        return self.n - self.start
+
+
+sampler = EpochSampler(len(tr))
+dl = torch.utils.data.DataLoader(DS(tr, False), batch_size=args.bs, sampler=sampler, num_workers=args.workers,
                                  collate_fn=collate, drop_last=True, persistent_workers=True)
 dv = torch.utils.data.DataLoader(DS(va, True), batch_size=args.bs, shuffle=False, num_workers=args.workers, collate_fn=collate)
 opt = torch.optim.AdamW([{"params": m.encoder.parameters(), "lr": args.lr}, {"params": list(m.head.parameters()) + (list(aux.parameters()) if NEXT or CTCW else []), "lr": 1e-3}],
                         betas=(0.9, 0.99), eps=1e-6, weight_decay=0.01)
-total = args.epochs * len(dl) // args.acc
+nb = len(tr) // args.bs          # 1 エポックのバッチの数
+total = args.epochs * nb // args.acc
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min((s + 1) / args.warmup, max(0.0, (total - s) / max(1, total - args.warmup))))
 print(f"学習 {len(tr)} 区間・検証 {len(va)} 区間・更新 {total} 回", flush=True)
 best, step, t0 = math.inf, 0, time.time()
-for ep in range(1, args.epochs + 1):
+ep0, kb0, CK = 1, 0, f"{args.out}/last.pt"
+if os.path.exists(CK):
+    c = torch.load(CK, map_location="cuda", weights_only=False)
+    m.load_state_dict(c["m"]); opt.load_state_dict(c["opt"]); sched.load_state_dict(c["sched"])
+    if "aux" in c:
+        aux.load_state_dict(c["aux"])
+    best, step, ep0, kb0 = c["best"], c["step"], c["ep"], c["kb"]
+    print(f"途中から再開：エポック {ep0} の {kb0} バッチ目・更新 {step} 回", flush=True)
+for ep in range(ep0, args.epochs + 1):
     run = []
-    for k, (feats, txts, tags, _, *rem) in enumerate(dl):
+    kb = kb0 if ep == ep0 else 0
+    sampler.ep, sampler.start = ep, kb * args.bs
+    for k, (feats, txts, tags, _, *rem) in enumerate(dl, start=kb):
         loss, _ = loss_batch(feats, tags, *rem, txts=txts)
         (loss / args.acc).backward(); run.append(loss.item())
         if (k + 1) % args.acc:
@@ -116,7 +139,7 @@ for ep in range(1, args.epochs + 1):
         if step % 100 == 0:
             print(f"エポック {ep} 更新 {step}/{total}  損失 {np.mean(run[-100 * args.acc:]):.4f}  {time.time() - t0:.0f} 秒  "
                   f"GPU メモリ最大 {torch.cuda.max_memory_allocated() / 2**30:.1f} GB", flush=True)
-        if step % 2000 == 0 or (k + 1) // args.acc == len(dl) // args.acc:
+        if step % 2000 == 0 or (k + 1) // args.acc == nb // args.acc:
             vl, acc = validate(dv)
             mark = ""
             if vl < best or args.ctc_only:
@@ -125,4 +148,11 @@ for ep in range(1, args.epochs + 1):
                 if CTCW:   # 11/26：音声認識の性能（CER）を後で測るため，補助タスクの出力層も残す
                     torch.save(aux.state_dict(), f"{args.out}/best_aux.pt")
             print(f"[エポック {ep} 更新 {step}] 検証の損失 {vl:.4f}  正解率 {acc:.4f}{mark}", flush=True)
+        if step % args.ckpt_every == 0 or (k + 1) // args.acc == nb // args.acc:
+            c = {"m": m.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "best": best, "step": step, "ep": ep, "kb": k + 1}
+            if NEXT or CTCW:
+                c["aux"] = aux.state_dict()
+            torch.save(c, CK + ".tmp"); os.replace(CK + ".tmp", CK)
 print(f"完了．最良の検証の損失 {best:.4f}  {time.time() - t0:.0f} 秒", flush=True)
+if os.path.exists(CK):
+    os.remove(CK)
