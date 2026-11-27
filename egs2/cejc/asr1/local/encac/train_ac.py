@@ -19,6 +19,7 @@ ap.add_argument("--lr", type=float, default=5e-5)
 ap.add_argument("--bs", type=int, default=16)
 ap.add_argument("--acc", type=int, default=4)
 ap.add_argument("--freeze_enc", action="store_true", help="エンコーダを固めて線形層だけ学習する（BatchNorm の統計も固める．11/05）")
+ap.add_argument("--ctc_only", action="store_true", help="3 クラスの損失を使わず，補助タスク（CTC）だけでエンコーダを学習する．CER の公平な基準（11/27）．検証の損失（3 クラス）は意味を持たないので，最後の重みを残す")
 ap.add_argument("--warmup", type=int, default=1000)
 ap.add_argument("--nval", type=int, default=4000)
 ap.add_argument("--workers", type=int, default=6)
@@ -76,7 +77,7 @@ def loss_batch(feats, tags, rem=None, txts=None):
         w = torch.where((y == 0) & (torch.tensor(rem, device="cuda") >= 1.0), HARDW, 1.0)
         l = (torch.nn.functional.cross_entropy(lg, y, reduction="none") * w).sum() / w.sum()
     elif rem is not None and CTCW:
-        l = l + CTCW * ctc_loss(txts, rem)
+        l = (l * 0.0 if args.ctc_only else l) + CTCW * ctc_loss(txts, rem)
     elif rem is not None:
         l = l + torch.nn.functional.mse_loss(2.0 * torch.sigmoid(aux(pooled["x"]).squeeze(1)), torch.tensor(rem, device="cuda", dtype=torch.float32))
     return l, (lg.argmax(1) == y).sum().item()
@@ -118,7 +119,7 @@ for ep in range(1, args.epochs + 1):
         if step % 2000 == 0 or (k + 1) // args.acc == len(dl) // args.acc:
             vl, acc = validate(dv)
             mark = ""
-            if vl < best:
+            if vl < best or args.ctc_only:
                 best = vl; mark = "  ← 最良"
                 torch.save(m.state_dict(), f"{args.out}/best.pt")
                 if CTCW:   # 11/26：音声認識の性能（CER）を後で測るため，補助タスクの出力層も残す
