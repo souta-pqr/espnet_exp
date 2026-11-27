@@ -12,6 +12,8 @@ silver13 の `~/2026/work/rt_eval_20261102/` で使ったもの（2026-11）．�
 - `rt_curve.py`：cut-in rate と latency の曲線．
 - `kobori_rt_dump.sh`・`kobori_rt_real.sh`：書き出しと実際に流す確認を並列で回す．
 - `kobori_chain*.sh`：実際に回したジョブ（日付と内容は各ファイルの頭）．
+- `rt_silero.py`：silero-vad のみ（無音が一定時間続いたら応答）の決め方を選ぶ．`rt_table.py`：実際に流した結果を `rt_rule.py` と同じ数え方で採点する．
+- `kobori_rt_dump10.sh`・`kobori_rt_real10.sh`・`run_dump10.sh`：silver10 で回したもの．`kobori_rt_dump_pool.sh`：exp-realtime-epd の複製で書き出す（全部書けたときだけ .done を置く）．
 
 ## 分析
 
@@ -19,6 +21,10 @@ silver13 の `~/2026/work/rt_eval_20261102/` で使ったもの（2026-11）．�
 - `rt_weak.py`・`rt_hes*.py`・`count_fd.py`・`rt_after_cont.py`：言いよどみ・発話の途中の間での応答．
 - `rt_soma.py`・`rt_miss_soma.py`：waseda_soma（人が付けたターンのラベル）での採点．
 - `rt_hazumi*.py`：Hazumi での採点．
+- `miss_breakdown.py`・`seg_mismatch.py`・`late_sil.py`・`ev2tsv.py`：応答しなかった区間を，音声区間と書き起こしの区間のずれ方で分ける．
+- `rt_pick_cap.py`・`kobori_cap.sh`：無音が一定の長さを超えた後のスコアを固定して選び直す．
+- `cutin_dist.py`：cut-in に数えた区間ごとの，無音の長さと応答までの時間．
+- `check_tailcount.py`・`check_incmean.py`：入力を伸ばしたとき後から値が変わるフレームの数と，フレームの平均を漸化式で更新しても今の計算と一致するか．
 
 データ（CEJC・waseda_soma・Hazumi の音声と書き起こし）と重みは含まない．
 
