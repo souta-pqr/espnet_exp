@@ -121,5 +121,7 @@ for ep in range(1, args.epochs + 1):
             if vl < best:
                 best = vl; mark = "  ← 最良"
                 torch.save(m.state_dict(), f"{args.out}/best.pt")
+                if CTCW:   # 11/26：音声認識の性能（CER）を後で測るため，補助タスクの出力層も残す
+                    torch.save(aux.state_dict(), f"{args.out}/best_aux.pt")
             print(f"[エポック {ep} 更新 {step}] 検証の損失 {vl:.4f}  正解率 {acc:.4f}{mark}", flush=True)
 print(f"完了．最良の検証の損失 {best:.4f}  {time.time() - t0:.0f} 秒", flush=True)
