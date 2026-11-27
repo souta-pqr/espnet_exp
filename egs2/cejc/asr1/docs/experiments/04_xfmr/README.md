@@ -1,7 +1,7 @@
 # 04 エンコーダ固定＋Transformer（ESPnet の Stage2）
 
 [03 音声認識](../03_stage1_asr/README.md) のエンコーダを固定し，その上に 2 層の Transformer を載せて，区間末の種類を判定する．
-今の報告では，これを比べる相手として使う（実時間の評価の `--model proposed_new`）．
+今の報告では，これを比較手法として使う（実時間の評価の `--model proposed_new`）．
 
 [← 全体の README](../../../../../../README.md)
 
@@ -18,7 +18,7 @@
 | gtnopast | 過去の文脈なし | gt と同じ手順で abnp から | `tt_batch_logs/run_abgt.sh gtnopast` |
 | **gtpostmnp** | 区間末の後だけで学習＋前の区間とつないだ音声（`train_gxm`）＋過去の文脈なし | gtnopast | `tt_batch_logs/run_gxm.sh gtpostmnp` |
 
-比べる相手として使っているのは **gtpostmnp**（exp-realtime-epd の `weights/proposed_gtpostmnp.pt`）．
+比較手法として使っているのは **gtpostmnp**（exp-realtime-epd の `weights/proposed_gtpostmnp.pt`）．
 
 ## 手順
 

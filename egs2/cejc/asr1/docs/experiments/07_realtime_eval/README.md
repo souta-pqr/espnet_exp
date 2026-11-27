@@ -53,7 +53,7 @@ python rt_rule.py <asr1>/data/eval_g $S/eval_g dump_eval_g_espmk1 --rule 0.4,0.8
 - 1 つの決め方だけを採点するときは `rt_rule.py ... --rule g1,th1,g2,th2,S,phi`，全部を試すときは `--grid --cut 0.08 [--eval <評価 data> <silero> <書き出し>]`．
 - cut-in rate と latency の曲線は `rt_curve.py`（引数は `rt_pick.py` と同じ）．
 
-## 比べる相手を評価する（決め方ごとに実際に流す）
+## 比較手法を評価する（決め方ごとに実際に流す）
 
 エンコーダ固定＋Transformer と Easy Turn は，応答するたびに発話を区切り直すので，後から当てはめた結果が実際と合わない．決め方ごとに開発データを実際に流して選び，選んだもので評価データを流す．計算の遅れが結果に入るので，1 つずつ流す．
 
