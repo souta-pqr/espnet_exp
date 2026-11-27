@@ -17,6 +17,7 @@ GTCONF = f"{ASR1}/exp/asr_20261030-turntaking-xfmr-pool_attn-frame2-blk42xh2-gts
 KIND = ENC.split(":", 1)[0]
 WSUM = os.environ.get("WSUM") == "1"   # espnet だけ：全部の層の出力の重み付き和を読む（11/06）
 TAIL = int(os.environ.get("TAIL", 0))   # espnet だけ：フレームの平均に，最後の TAIL フレーム（1 フレーム約 33 ms）の平均をつないで読む（11/13．長い入力で言い終わりが薄まるため）
+POOL = int(os.environ.get("POOL", 0))   # espnet だけ：0 でなければ，全フレームの平均の代わりに最後の POOL フレーム（1 フレーム 33 ms）の平均で読む．1＝最後のフレームだけ（11/26．前の発話の特徴が混ざらないように）
 MAXS = 30 * 16000
 
 
@@ -91,6 +92,8 @@ class ESP(torch.nn.Module):
             h = (torch.softmax(self.head.lw, 0)[:, None, None, None] * hs).sum(0)
         i = torch.arange(h.size(1), device=dev)[None]
         k = (i < hl[:, None]).float()
+        if POOL:
+            k = k * (i >= hl[:, None] - POOL).float()
         v = (h * k[..., None]).sum(1) / k.sum(1, keepdim=True)
         if TAIL:
             k2 = k * (i >= hl[:, None] - TAIL).float()
